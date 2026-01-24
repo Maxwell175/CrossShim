@@ -1,0 +1,13 @@
+--- a/accel/tcg/vcpu-state.h
++++ b/accel/tcg/vcpu-state.h
+@@ -15,6 +15,10 @@
+ #ifdef CONFIG_USER_ONLY
+ static inline TaskState *get_task_state(const CPUState *cs)
+ {
++    /* Guard against NULL cpu (can happen on non-QEMU threads like .NET runtime) */
++    if (cs == NULL) {
++        return NULL;
++    }
+     return cs->opaque;
+ }
+ #endif

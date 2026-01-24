@@ -1,0 +1,17 @@
+pyproject.toml
+android_wrapper_generator/__init__.py
+android_wrapper_generator/cli.py
+android_wrapper_generator/code_generator.py
+android_wrapper_generator/symbol_extractor.py
+android_wrapper_generator/wrapper_generator.py
+android_wrapper_generator.egg-info/PKG-INFO
+android_wrapper_generator.egg-info/SOURCES.txt
+android_wrapper_generator.egg-info/dependency_links.txt
+android_wrapper_generator.egg-info/entry_points.txt
+android_wrapper_generator.egg-info/requires.txt
+android_wrapper_generator.egg-info/top_level.txt
+tests/test_cli.py
+tests/test_code_generator.py
+tests/test_e2e.py
+tests/test_symbol_extractor.py
+tests/test_wrapper_generator.py

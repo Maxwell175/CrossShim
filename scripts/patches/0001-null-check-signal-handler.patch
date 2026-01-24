@@ -1,0 +1,113 @@
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -27,6 +27,26 @@
+ #include "trace.h"
+ #include "signal-common.h"
+
++/*
++ * Async-signal-safe thread identification using pthread_key.
++ *
++ * We can't use thread_cpu (a __thread variable) in the signal handler because
++ * accessing it may call __tls_get_addr which is NOT async-signal-safe and can
++ * deadlock if the signal interrupts a thread already in TLS/malloc code.
++ *
++ * Instead, we use pthread_getspecific() which IS async-signal-safe (POSIX).
++ * QEMU threads set this key to non-NULL; non-QEMU threads leave it NULL.
++ */
++pthread_key_t qemu_thread_key;
++static pthread_once_t qemu_thread_key_once = PTHREAD_ONCE_INIT;
++
++static void qemu_thread_key_create(void) {
++    pthread_key_create(&qemu_thread_key, NULL);
++}
++
++void qemu_mark_thread_as_qemu(void) {
++    pthread_once(&qemu_thread_key_once, qemu_thread_key_create);
++    pthread_setspecific(qemu_thread_key, (void*)1);
++}
+
+ static struct target_sigaction sigact_table[TARGET_NSIG];
+
+@@ -1065,9 +1085,18 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
+
+ void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
+ {
+-    CPUState *cpu = thread_cpu;
++    CPUState *cpu;
++
++    /*
++     * Check if this is a QEMU thread using async-signal-safe pthread_getspecific.
++     * Non-QEMU threads (e.g., .NET runtime) won't have the key set.
++     * We MUST check this BEFORE accessing thread_cpu to avoid TLS deadlock.
++     */
++    if (pthread_getspecific(qemu_thread_key) == NULL) {
++        return;
++    }
+
+-    /* If thread_cpu is NULL, this is a non-QEMU thread (e.g., .NET runtime thread).
+-     * Don't process the signal - let the default handler deal with it. */
++    cpu = thread_cpu;
++    /* Redundant safety check */
+     if (cpu == NULL) {
+         return;
+     }
+@@ -1156,6 +1185,12 @@ void signal_init(void)
+     struct sigaction act;
+     struct sigaction oact;
+
++    /*
++     * Initialize the pthread key for async-signal-safe thread identification.
++     * This must be called before any signals are installed.
++     */
++    pthread_once(&qemu_thread_key_once, qemu_thread_key_create);
++
+     /* Set the signal mask from the host mask. */
+     sigprocmask(0, 0, &act.sa_mask);
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -125,6 +125,9 @@
+ #include "fd-trans.h"
+ #include "user/safe-syscall.h"
+
++/* Defined in signal.c - marks current thread as a QEMU thread */
++extern void qemu_mark_thread_as_qemu(void);
++
+ #if defined(__NR_utimensat) \
+     || defined(TARGET_NR_utimensat) \
+     || defined(TARGET_NR_utimensat_time64)
+@@ -6594,6 +6597,10 @@ static void *clone_func(void *arg)
+     rcu_register_thread();
+     tcg_register_thread();
+     env = cpu_env(cpu);
++
++    /* Mark this thread as a QEMU thread for signal handler safety */
++    qemu_mark_thread_as_qemu();
++
+     thread_cpu = cpu;
+     ts = get_task_state(cpu);
+     info->tid = sys_gettid();
+--- a/libafl/user.c
++++ b/libafl/user.c
+@@ -6,6 +6,9 @@
+
+ extern abi_ulong target_brk, initial_target_brk;
+
++/* Defined in linux-user/signal.c - marks current thread as a QEMU thread */
++extern void qemu_mark_thread_as_qemu(void);
++
+ static struct image_info libafl_image_info;
+
+ static struct libafl_qemu_sig_ctx libafl_qemu_sig_ctx = {0};
+@@ -66,6 +69,10 @@ bool libafl_get_return_on_crash(void) { return libafl_return_on_crash; }
+ #ifdef AS_LIB
+ void libafl_qemu_init(int argc, char** argv)
+ {
++    /*
++     * Mark this thread as a QEMU thread BEFORE signal_init() is called.
++     * This allows the signal handler to safely identify QEMU threads.
++     */
++    qemu_mark_thread_as_qemu();
+     // main function in usermode has an env parameter but is unused in practice.
+     _libafl_qemu_user_init(argc, argv, NULL);
+ }

@@ -1,0 +1,2 @@
+[console_scripts]
+android-wrapper-gen = android_wrapper_generator.cli:main

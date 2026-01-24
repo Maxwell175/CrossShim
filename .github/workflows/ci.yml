@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test-emulator:
+    name: Build and Test CrossShim
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config
+          # Install QEMU build dependencies
+          sudo apt-get install -y libglib2.0-dev libpixman-1-dev
+          # Install LIEF
+          pip install lief
+          # Get LIEF cmake package location
+          LIEF_DIR=$(python -c "import lief; import os; print(os.path.dirname(lief.__file__))")
+          echo "LIEF_DIR=$LIEF_DIR" >> $GITHUB_ENV
+
+      - name: Build LibAFL QEMU
+        run: |
+          chmod +x scripts/build_qemu_libafl.sh
+          cd scripts && ./build_qemu_libafl.sh
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          sdkmanager --install "ndk;25.2.9519653"
+          echo "ANDROID_NDK_TOOLCHAIN=$ANDROID_HOME/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_ENV
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=ON \
+            -DLIEF_DIR=${{ env.LIEF_DIR }}/cmake
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run emulator tests
+        run: |
+          chmod +x test/run_emulator_tests.sh
+          test/run_emulator_tests.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lib-emu-linux
+          path: |
+            build/libcross_shim.a
+            include/*.h
+
+  test-wrapper-generator:
+    name: Test Wrapper Generator
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          sdkmanager --install "ndk;25.2.9519653"
+          echo "ANDROID_NDK_TOOLCHAIN=$ANDROID_HOME/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_ENV
+
+      - name: Install wrapper generator
+        working-directory: wrapper_generator
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        working-directory: wrapper_generator
+        run: |
+          python -m pytest tests/ -v \
+            --cov=android_wrapper_generator \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: wrapper_generator/htmlcov/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: wrapper_generator/coverage.xml
+          fail_ci_if_error: false
+        continue-on-error: true
+
+  build-release:
+    name: Build Release Artifacts
+    needs: [build-and-test-emulator, test-wrapper-generator]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download emulator build
+        uses: actions/download-artifact@v4
+        with:
+          name: android-lib-emu-linux
+          path: release/
+
+      - name: Create release package
+        run: |
+          cd release
+          tar -czvf android-lib-emu-linux.tar.gz *
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: release/android-lib-emu-linux.tar.gz

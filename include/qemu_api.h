@@ -1,0 +1,494 @@
+/**
+ * QEMU API Wrapper
+ *
+ * This header provides a clean C++ interface to the LibAFL QEMU APIs.
+ * It wraps the C APIs from qemu-libafl-bridge for use in CrossShim.
+ */
+
+#ifndef QEMU_API_H
+#define QEMU_API_H
+
+#include <cstdint>
+#include <cstddef>
+
+// Forward declarations from QEMU
+struct CPUState;
+struct CPUArchState;
+
+extern "C" {
+
+// =============================================================================
+// QEMU Initialization
+// =============================================================================
+
+/**
+ * Initialize QEMU with command-line arguments
+ * This is the main entry point for the library mode.
+ * @param argc Argument count
+ * @param argv Argument vector
+ */
+void libafl_qemu_init(int argc, char** argv);
+
+/**
+ * Initialize QEMU usermode (internal)
+ * @param argc Argument count
+ * @param argv Argument vector
+ * @param envp Environment vector
+ * @return 0 on success
+ */
+int _libafl_qemu_user_init(int argc, char** argv, char** envp);
+
+/**
+ * Run QEMU emulation
+ * @return Exit code
+ */
+int libafl_qemu_run(void);
+
+/**
+ * Main entry point (weak symbol, can be overridden)
+ */
+int libafl_qemu_main(void);
+
+// =============================================================================
+// CPU Access
+// =============================================================================
+
+/**
+ * Get CPU by index
+ * @param cpu_index CPU index (0-based)
+ * @return CPU state pointer or NULL
+ */
+CPUState* libafl_qemu_get_cpu(int cpu_index);
+
+/**
+ * Get current CPU
+ * @return Current CPU state pointer
+ */
+CPUState* libafl_qemu_current_cpu(void);
+
+/**
+ * Set current CPU for this thread
+ * In MTTCG mode, this must be called before libafl_qemu_run()
+ * if running from a non-QEMU-managed thread
+ * @param cpu CPU state pointer
+ */
+void libafl_qemu_set_current_cpu(CPUState* cpu);
+
+/**
+ * Register this thread with TCG runtime
+ * Must be called by any non-main thread before running TCG code
+ */
+void tcg_register_thread(void);
+
+/**
+ * Get CPU index
+ * @param cpu CPU state pointer
+ * @return CPU index
+ */
+int libafl_qemu_cpu_index(CPUState* cpu);
+
+/**
+ * Get number of CPUs
+ * @return CPU count
+ */
+int libafl_qemu_num_cpus(void);
+
+/**
+ * Get number of registers for a CPU
+ * @param cpu CPU state pointer
+ * @return Register count
+ */
+int libafl_qemu_num_regs(CPUState* cpu);
+
+// =============================================================================
+// Register Access
+// =============================================================================
+
+/**
+ * Read a register value
+ * @param cpu CPU state pointer
+ * @param reg Register index
+ * @param val Output buffer (8 bytes for 64-bit registers)
+ * @return 0 on success, negative on error
+ */
+int libafl_qemu_read_reg(CPUState* cpu, int reg, uint8_t* val);
+
+/**
+ * Write a register value
+ * @param cpu CPU state pointer
+ * @param reg Register index
+ * @param val Input buffer (8 bytes for 64-bit registers)
+ * @return 0 on success, negative on error
+ */
+int libafl_qemu_write_reg(CPUState* cpu, int reg, uint8_t* val);
+
+// =============================================================================
+// Memory Access
+// =============================================================================
+
+/**
+ * Read/write guest memory via CPU debug interface
+ * @param cpu CPU state pointer
+ * @param addr Guest virtual address
+ * @param buf Host buffer
+ * @param len Number of bytes
+ * @param is_write 0 for read, 1 for write
+ * @return 0 on success, negative on error
+ */
+int cpu_memory_rw_debug(CPUState* cpu, uint64_t addr, void* buf, size_t len, int is_write);
+
+/**
+ * Map memory in guest address space
+ * @param addr Guest address (0 to let QEMU choose)
+ * @param len Size in bytes
+ * @param prot Protection flags (PROT_READ | PROT_WRITE | PROT_EXEC)
+ * @param flags Mapping flags (MAP_ANONYMOUS | MAP_PRIVATE, etc.)
+ * @param fd File descriptor (-1 for anonymous)
+ * @param offset File offset
+ * @return Mapped address or -1 on error
+ */
+uint64_t target_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
+
+/**
+ * Unmap guest memory
+ * @param addr Guest address
+ * @param len Size in bytes
+ * @return 0 on success
+ */
+int target_munmap(uint64_t addr, uint64_t len);
+
+// =============================================================================
+// Syscall Hooks
+// =============================================================================
+
+/**
+ * Syscall hook result
+ */
+enum libafl_syshook_ret_tag {
+    LIBAFL_SYSHOOK_RUN,   // Execute syscall normally
+    LIBAFL_SYSHOOK_SKIP,  // Skip syscall, use provided return value
+};
+
+struct libafl_syshook_ret {
+    enum libafl_syshook_ret_tag tag;
+    union {
+        uint64_t syshook_skip_retval;
+    };
+};
+
+/**
+ * Pre-syscall hook callback type
+ */
+typedef struct libafl_syshook_ret (*libafl_pre_syscall_cb)(
+    uint64_t data, int sys_num,
+    uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
+    uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t arg7);
+
+/**
+ * Post-syscall hook callback type
+ */
+typedef uint64_t (*libafl_post_syscall_cb)(
+    uint64_t data, uint64_t ret, int sys_num,
+    uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
+    uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t arg7);
+
+/**
+ * Add pre-syscall hook
+ * @param callback Hook function
+ * @param data User data passed to callback
+ * @return Hook ID
+ */
+size_t libafl_add_pre_syscall_hook(libafl_pre_syscall_cb callback, uint64_t data);
+
+/**
+ * Add post-syscall hook
+ * @param callback Hook function
+ * @param data User data passed to callback
+ * @return Hook ID
+ */
+size_t libafl_add_post_syscall_hook(libafl_post_syscall_cb callback, uint64_t data);
+
+/**
+ * Remove pre-syscall hook
+ * @param num Hook ID
+ * @return 1 if removed, 0 if not found
+ */
+int libafl_qemu_remove_pre_syscall_hook(size_t num);
+
+/**
+ * Remove post-syscall hook
+ * @param num Hook ID
+ * @return 1 if removed, 0 if not found
+ */
+int libafl_qemu_remove_post_syscall_hook(size_t num);
+
+// =============================================================================
+// Thread Hooks
+// =============================================================================
+
+/**
+ * New thread hook callback type
+ * @param data User data
+ * @param env CPU architecture state
+ * @param tid Thread ID
+ * @return true to allow thread, false to deny
+ */
+typedef bool (*libafl_new_thread_cb)(uint64_t data, CPUArchState* env, uint32_t tid);
+
+/**
+ * Add new thread hook
+ * @param callback Hook function
+ * @param data User data passed to callback
+ * @return Hook ID
+ */
+size_t libafl_add_new_thread_hook(libafl_new_thread_cb callback, uint64_t data);
+
+/**
+ * Remove new thread hook
+ * @param num Hook ID
+ * @return 1 if removed, 0 if not found
+ */
+int libafl_qemu_remove_new_thread_hook(size_t num);
+
+// =============================================================================
+// Block Hooks (for tracing/debugging)
+// =============================================================================
+
+typedef uint64_t (*libafl_block_pre_gen_cb)(uint64_t data, uint64_t pc);
+typedef void (*libafl_block_post_gen_cb)(uint64_t data, uint64_t pc, uint64_t block_length);
+typedef void (*libafl_block_exec_cb)(uint64_t data, uint64_t id);
+
+/**
+ * Add block execution hook
+ * @param pre_gen_cb Called before block generation
+ * @param post_gen_cb Called after block generation
+ * @param exec_cb Called on block execution
+ * @param data User data
+ * @return Hook ID
+ */
+size_t libafl_add_block_hook(libafl_block_pre_gen_cb pre_gen_cb,
+                              libafl_block_post_gen_cb post_gen_cb,
+                              libafl_block_exec_cb exec_cb,
+                              uint64_t data);
+
+/**
+ * Remove block hook
+ * @param num Hook ID
+ * @param invalidate Whether to flush JIT
+ * @return 1 if removed, 0 if not found
+ */
+int libafl_qemu_remove_block_hook(size_t num, int invalidate);
+
+// =============================================================================
+// JIT/Translation Cache
+// =============================================================================
+
+/**
+ * Flush JIT translation cache
+ */
+void libafl_flush_jit(void);
+
+// =============================================================================
+// Instruction Hooks (for single-stepping/debugging)
+// =============================================================================
+
+/**
+ * Callback type for instruction hooks
+ */
+typedef void (*libafl_instruction_cb)(uint64_t data, uint64_t pc);
+
+/**
+ * Add instruction hook at a specific address
+ * @param pc Address to hook
+ * @param callback Function to call when address is executed
+ * @param data User data passed to callback
+ * @param invalidate Whether to invalidate JIT cache
+ * @return Hook ID
+ */
+size_t libafl_qemu_add_instruction_hooks(uint64_t pc,
+                                         libafl_instruction_cb callback,
+                                         uint64_t data, int invalidate);
+
+/**
+ * Remove instruction hook
+ * @param num Hook ID
+ * @param invalidate Whether to invalidate JIT cache
+ * @return 1 if removed, 0 if not found
+ */
+int libafl_qemu_remove_instruction_hook(size_t num, int invalidate);
+
+/**
+ * Remove all instruction hooks at an address
+ * @param addr Address
+ * @param invalidate Whether to invalidate JIT cache
+ * @return Number of hooks removed
+ */
+size_t libafl_qemu_remove_instruction_hooks_at(uint64_t addr, int invalidate);
+
+// =============================================================================
+// Usermode Helpers
+// =============================================================================
+
+/**
+ * Get load address of main binary
+ * @return Load address
+ */
+uint64_t libafl_load_addr(void);
+
+/**
+ * Get current break (heap end)
+ * @return Current brk address
+ */
+uint64_t libafl_get_brk(void);
+
+/**
+ * Set break (heap end)
+ * @param new_brk New brk address
+ * @return Old brk address
+ */
+uint64_t libafl_set_brk(uint64_t new_brk);
+
+/**
+ * Get initial break value
+ * @return Initial brk address
+ */
+uint64_t libafl_get_initial_brk(void);
+
+/**
+ * Set QEMU environment for current CPU
+ * @param env CPU architecture state
+ */
+void libafl_set_qemu_env(CPUArchState* env);
+
+// =============================================================================
+// Breakpoints
+// =============================================================================
+
+/**
+ * Set a breakpoint at an address
+ * @param addr Guest address
+ * @return Breakpoint ID on success, or error value
+ */
+size_t libafl_qemu_set_breakpoint(uint64_t addr);
+
+/**
+ * Remove a breakpoint
+ * @param addr Guest address
+ * @return 1 if removed, 0 if not found
+ */
+int libafl_qemu_remove_breakpoint(uint64_t addr);
+
+// =============================================================================
+// Exit/Crash Handling
+// =============================================================================
+
+/**
+ * Check if QEMU should exit ASAP
+ * @return true if should exit
+ */
+bool libafl_exit_asap(void);
+
+/**
+ * Request crash exit
+ * @param cpu CPU state
+ */
+void libafl_exit_request_crash(CPUState* cpu);
+
+/**
+ * Set return on crash behavior
+ * @param return_on_crash true to return instead of crashing
+ */
+void libafl_set_return_on_crash(bool return_on_crash);
+
+/**
+ * Get return on crash setting
+ * @return Current setting
+ */
+bool libafl_get_return_on_crash(void);
+
+} // extern "C"
+
+// =============================================================================
+// ARM64 Register Indices (for libafl_qemu_read_reg/write_reg)
+// =============================================================================
+
+namespace qemu {
+
+// These match LibAFL QEMU's register numbering for AArch64
+enum Arm64Reg {
+    // General purpose registers (X0-X30)
+    REG_X0 = 0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5, REG_X6, REG_X7,
+    REG_X8, REG_X9, REG_X10, REG_X11, REG_X12, REG_X13, REG_X14, REG_X15,
+    REG_X16, REG_X17, REG_X18, REG_X19, REG_X20, REG_X21, REG_X22, REG_X23,
+    REG_X24, REG_X25, REG_X26, REG_X27, REG_X28, REG_X29, REG_X30,
+    REG_SP = 31,   // Stack pointer
+    REG_PC = 32,   // Program counter
+    REG_CPSR = 33, // Condition flags (PSTATE/NZCV)
+    REG_TPIDR_EL0 = 34, // Thread-local storage pointer
+
+    // SIMD/FP registers start at 64 (V0-V31 are 128-bit each)
+    REG_V0 = 64,
+    REG_V1 = 65,
+    REG_V2 = 66,
+    REG_V3 = 67,
+    REG_V4 = 68,
+    REG_V5 = 69,
+    REG_V6 = 70,
+    REG_V7 = 71,
+    REG_V8 = 72,
+    REG_V9 = 73,
+    REG_V10 = 74,
+    REG_V11 = 75,
+    REG_V12 = 76,
+    REG_V13 = 77,
+    REG_V14 = 78,
+    REG_V15 = 79,
+    REG_V16 = 80,
+    REG_V17 = 81,
+    REG_V18 = 82,
+    REG_V19 = 83,
+    REG_V20 = 84,
+    REG_V21 = 85,
+    REG_V22 = 86,
+    REG_V23 = 87,
+    REG_V24 = 88,
+    REG_V25 = 89,
+    REG_V26 = 90,
+    REG_V27 = 91,
+    REG_V28 = 92,
+    REG_V29 = 93,
+    REG_V30 = 94,
+    REG_V31 = 95,
+
+    // Floating-point control/status registers
+    REG_FPCR = 96,
+    REG_FPSR = 97,
+
+    // Aliases
+    REG_FP = REG_X29,  // Frame pointer
+    REG_LR = REG_X30,  // Link register
+};
+
+// Helper functions for register access
+inline uint64_t read_reg(CPUState* cpu, int reg) {
+    uint64_t val = 0;
+    libafl_qemu_read_reg(cpu, reg, reinterpret_cast<uint8_t*>(&val));
+    return val;
+}
+
+inline void write_reg(CPUState* cpu, int reg, uint64_t val) {
+    libafl_qemu_write_reg(cpu, reg, reinterpret_cast<uint8_t*>(&val));
+}
+
+// Memory access helpers
+inline bool mem_read(CPUState* cpu, uint64_t addr, void* buf, size_t len) {
+    return cpu_memory_rw_debug(cpu, addr, buf, len, 0) == 0;
+}
+
+inline bool mem_write(CPUState* cpu, uint64_t addr, const void* buf, size_t len) {
+    return cpu_memory_rw_debug(cpu, addr, const_cast<void*>(buf), len, 1) == 0;
+}
+
+} // namespace qemu
+
+#endif // QEMU_API_H
