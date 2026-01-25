@@ -153,14 +153,6 @@ std::pair<uint64_t, uint64_t> ElfLoader::get_init_array_info() const {
     return {init_array_addr, init_array_size};
 }
 
-std::vector<uint64_t> ElfLoader::get_init_array() const {
-    std::vector<uint64_t> init_funcs;
-    if (!binary_) return init_funcs;
-
-    // This method is deprecated - use get_init_array_info() and read from memory instead
-    return init_funcs;
-}
-
 std::vector<uint64_t> ElfLoader::get_fini_array() const {
     std::vector<uint64_t> fini_funcs;
     if (!binary_) return fini_funcs;

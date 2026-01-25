@@ -43,9 +43,6 @@
 #include <pthread.h>
 #include <cerrno>
 
-// Path to QEMU stub binary
-static const char* QEMU_STUB_PATH = nullptr;
-
 // QEMU's thread-local CPU variables - defined in QEMU
 // current_cpu: general purpose current CPU
 // thread_cpu: the thread-local CPU used by signal handlers - THIS IS THE ONE WE NEED
@@ -76,33 +73,25 @@ int libafl_qemu_main(void) {
 // ALL signals that QEMU handles and check current_cpu before forwarding.
 // =============================================================================
 
-static std::atomic<bool> g_in_signal_handler{false};
-
 // Store QEMU's original handlers for all signals
 static struct sigaction g_qemu_handlers[64];
 static bool g_handlers_wrapped = false;
 
 // Universal signal handler wrapper
 static void universal_signal_wrapper(int sig, siginfo_t* info, void* context) {
-    // Always log that we're in the wrapper - this proves we're being called
-    {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "[WRAPPER-CALLED] sig=%d thread_cpu=%p\n", sig, (void*)thread_cpu);
-        (void)write(STDERR_FILENO, msg, strlen(msg));
-    }
-
-    // Debug: signal-safe write to stderr
-    static const char* sig_names[] = {"?", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV"};
-    const char* sig_name = (sig >= 0 && sig <= 11) ? sig_names[sig] : "?";
-
     // CRITICAL: Check thread_cpu (NOT current_cpu!) BEFORE doing anything that might crash
     // QEMU's host_signal_handler uses thread_cpu which is different from current_cpu!
     if (thread_cpu == nullptr) {
         // This is a non-QEMU thread (e.g., .NET runtime thread).
         // We CANNOT forward to QEMU's handler as it will crash.
+#if EMU_LOGGING_ENABLED
+        // Note: Using write() for signal-safety (EMU_LOG uses mutex, not safe here)
+        static const char* sig_names[] = {"?", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV"};
+        const char* sig_name = (sig >= 0 && sig <= 11) ? sig_names[sig] : "?";
         char msg[128];
-        snprintf(msg, sizeof(msg), "[SIGNAL-WRAPPER] sig=%d (%s) on non-QEMU thread (thread_cpu=NULL), blocking\n", sig, sig_name);
+        snprintf(msg, sizeof(msg), "[SIGNAL-WRAPPER] sig=%d (%s) on non-QEMU thread, blocking\n", sig, sig_name);
         (void)write(STDERR_FILENO, msg, strlen(msg));
+#endif
 
         // For SIGSEGV/SIGBUS/SIGABRT on non-QEMU threads, we should exit.
         // For other signals, we can safely ignore them.
@@ -254,7 +243,6 @@ static void debug_instruction_hook(uint64_t data, uint64_t pc) {
                       << " X0=0x" << qemu::read_reg(cpu, qemu::REG_X0)
                       << std::dec << std::endl;
         }
-        std::cerr.flush();
     }
 }
 
@@ -438,13 +426,12 @@ static libafl_syshook_ret pre_syscall_hook(
     uint64_t hook_sp = qemu::read_reg(hook_cpu, qemu::REG_SP);
     uint64_t hook_pc = qemu::read_reg(hook_cpu, qemu::REG_PC);
 
+#if EMU_VERBOSE_LOGGING
     // Only log child thread syscalls (SP in 0x90xxxxxx range) or debug syscalls
     bool is_child_thread = (hook_sp >= 0x90000000 && hook_sp < 0x91000000);
     bool is_debug_syscall = (sys_num == SYS_THREAD_DONE || sys_num == SYS_THREAD_START || sys_num == SYS_CLONE_DEBUG);
     // Also log network-related syscalls (socket=198, connect=203, bind=200, sendto=206, recvfrom=207)
     bool is_network_syscall = (sys_num == 198 || sys_num == 200 || sys_num == 203 || sys_num == 206 || sys_num == 207);
-    // Log HLE syscalls from child threads
-    bool is_hle_syscall = (sys_num >= 0x2000 && sys_num < 0x3000);
 
     if (is_child_thread) {
         EMU_LOG_VERBOSE << "[CHILD_SYSCALL] #" << std::hex << sys_num << " SP=0x" << hook_sp
@@ -455,6 +442,7 @@ static libafl_syshook_ret pre_syscall_hook(
                   << " (args: " << arg0 << ", " << arg1 << ", " << arg2
                   << ", " << arg3 << ", " << arg4 << ", " << arg5 << ")" << std::dec << std::endl;
     }
+#endif
 
     // Handle debug after clone marker
     if (sys_num == SYS_CLONE_DEBUG) {
@@ -518,12 +506,14 @@ static libafl_syshook_ret pre_syscall_hook(
             // Multiple calls to libafl_qemu_current_cpu() in MTTCG mode may race
             CPUState* cached_cpu = hook_cpu;  // Already obtained at line 355
 
+#if EMU_VERBOSE_LOGGING
             // Log child thread HLE syscalls for debugging
-            if (is_child_thread) {
+            if (hook_sp >= 0x90000000 && hook_sp < 0x91000000) {
                 EMU_LOG_VERBOSE << "[HLE_SYSCALL] Child thread: #0x" << std::hex << sys_num
                           << " -> addr=0x" << hle_addr << " SP=0x" << hook_sp
                           << std::dec << std::endl;
             }
+#endif
 
             // Call the HLE handler with cached CPU
             // NOTE: HLE handlers run on whichever thread triggered them. With MTTCG,
@@ -817,8 +807,10 @@ bool HleManager::handle(uint64_t address) {
     return true;
 }
 
+#if EMU_LOGGING_ENABLED
 // HLE call counter - no per-call locking overhead
 static std::atomic<uint64_t> g_hle_total_calls{0};
+#endif
 
 bool HleManager::handle_with_cpu(void *cpu_ptr, uint64_t address) {
     auto it = address_to_name_.find(address);
@@ -842,11 +834,13 @@ bool HleManager::handle_with_cpu(void *cpu_ptr, uint64_t address) {
 
     tls_cpu = old_tls;
 
+#if EMU_LOGGING_ENABLED
     // Simple counter - no locking
     uint64_t total_calls = ++g_hle_total_calls;
     if (total_calls % 50000 == 0) {
         EMU_LOG << "[HLE-STATS] Total HLE calls: " << total_calls << std::endl;
     }
+#endif
 
     return true;
 }
@@ -1184,36 +1178,6 @@ void Emulator::initialize_global_data() {
     global_symbols_["__sF"] = sf_addr;
 }
 
-// Block counter for periodic yielding
-static thread_local uint64_t g_block_count = 0;
-static constexpr uint64_t BLOCKS_PER_YIELD = 1000000;  // Yield every 1M blocks
-
-// Block execution hook - forces periodic yields
-static uint64_t block_pre_gen(uint64_t data, uint64_t pc) {
-    // Return a unique ID for this block (we use the PC)
-    return pc;
-}
-
-static void block_post_gen(uint64_t data, uint64_t pc, uint64_t block_length) {
-    // Not used
-}
-
-static void block_exec(uint64_t data, uint64_t id) {
-    // DISABLED: With QEMU MTTCG (multi-threaded TCG), threads run in parallel
-    // on real host threads. The periodic yield mechanism is not needed and
-    // calling libafl_exit_request_crash() can interfere with thread execution.
-    //
-    // Old cooperative threading code:
-    // g_block_count++;
-    // if (g_block_count >= BLOCKS_PER_YIELD) {
-    //     g_block_count = 0;
-    //     CPUState* cpu = libafl_qemu_current_cpu();
-    //     if (cpu) {
-    //         libafl_exit_request_crash(cpu);
-    //     }
-    // }
-}
-
 void Emulator::setup_hooks() {
     // Configure QEMU to return on crashes/traps instead of exiting
     // This allows us to handle BRK instructions (HLE traps) gracefully
@@ -1223,12 +1187,7 @@ void Emulator::setup_hooks() {
     syscall_hook_id_ = libafl_add_pre_syscall_hook(pre_syscall_hook,
                                                     reinterpret_cast<uint64_t>(this));
 
-    // Add block execution hook for periodic yielding
-    block_hook_id_ = libafl_add_block_hook(block_pre_gen, block_post_gen, block_exec,
-                                            reinterpret_cast<uint64_t>(this));
-
     EMU_LOG << "[EMU] Registered syscall hook (id=" << syscall_hook_id_ << ")" << std::endl;
-    EMU_LOG << "[EMU] Registered block hook for periodic yielding (id=" << block_hook_id_ << ")" << std::endl;
 }
 
 void Emulator::add_mem_write_hook() {
@@ -1248,15 +1207,19 @@ void Emulator::disable_trace() {
     // No-op for now
 }
 
+#if EMU_LOGGING_ENABLED
 // Profiling for start() - tracks where time is spent in emulation
 static std::atomic<uint64_t> g_start_count{0};
 static std::atomic<uint64_t> g_total_setup_ns{0};
 static std::atomic<uint64_t> g_total_qemu_run_ns{0};
 static std::atomic<uint64_t> g_total_loop_iterations{0};
 static std::chrono::steady_clock::time_point g_last_start_report = std::chrono::steady_clock::now();
+#endif
 
 bool Emulator::start(uint64_t address, uint64_t end_address) {
+#if EMU_LOGGING_ENABLED
     auto start_time = std::chrono::steady_clock::now();
+#endif
 
     tl_running = true;  // Thread-local: each thread tracks its own execution state
 
@@ -1467,6 +1430,7 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
 
     tl_running = false;
 
+#if EMU_LOGGING_ENABLED
     // Update profiling stats
     auto end_time = std::chrono::steady_clock::now();
     uint64_t total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
@@ -1486,12 +1450,13 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
             double avg_us = (double)total / count / 1000.0;
             double avg_loops = (double)loops / count;
             double calls_per_sec = (double)count / since_report;
-            std::cerr << "[EMU_START_PROFILE] " << count << " starts in " << since_report << "s"
-                      << " (" << std::fixed << std::setprecision(1) << calls_per_sec << "/s)"
-                      << " avg=" << avg_us << "us avg_loops=" << avg_loops << std::endl;
+            EMU_LOG << "[EMU_START_PROFILE] " << count << " starts in " << since_report << "s"
+                    << " (" << std::fixed << std::setprecision(1) << calls_per_sec << "/s)"
+                    << " avg=" << avg_us << "us avg_loops=" << avg_loops << std::endl;
         }
         g_last_start_report = now;
     }
+#endif
 
     return true;
 }
@@ -1599,7 +1564,7 @@ void Emulator::emulator_thread_func() {
     {
         const char* no_realtime = std::getenv("EMU_NO_REALTIME");
         if (no_realtime && (std::string(no_realtime) == "1" || std::string(no_realtime) == "true")) {
-            std::cerr << "[EMU] Real-time scheduling disabled via EMU_NO_REALTIME" << std::endl;
+            EMU_LOG << "[EMU] Real-time scheduling disabled via EMU_NO_REALTIME" << std::endl;
         } else {
             pthread_t self = pthread_self();
 
@@ -1609,22 +1574,22 @@ void Emulator::emulator_thread_func() {
             param.sched_priority = 50;
             int ret = pthread_setschedparam(self, SCHED_FIFO, &param);
             if (ret == 0) {
-                std::cerr << "[EMU] Set SCHED_FIFO priority 50 for emulator thread" << std::endl;
+                EMU_LOG << "[EMU] Set SCHED_FIFO priority 50 for emulator thread" << std::endl;
             } else {
                 // Fall back: try SCHED_RR (round-robin real-time)
                 ret = pthread_setschedparam(self, SCHED_RR, &param);
                 if (ret == 0) {
-                    std::cerr << "[EMU] Set SCHED_RR priority 50 for emulator thread" << std::endl;
+                    EMU_LOG << "[EMU] Set SCHED_RR priority 50 for emulator thread" << std::endl;
                 } else {
                     // Can't get real-time, at least try to raise nice priority
                     // nice(-10) requires CAP_SYS_NICE or being in an appropriate group
                     errno = 0;
                     int new_nice = nice(-10);
                     if (errno == 0) {
-                        std::cerr << "[EMU] Set nice=" << new_nice << " for emulator thread" << std::endl;
+                        EMU_LOG << "[EMU] Set nice=" << new_nice << " for emulator thread" << std::endl;
                     } else {
-                        std::cerr << "[EMU] Note: Real-time priority not available (need CAP_SYS_NICE or root)" << std::endl;
-                        std::cerr << "[EMU] Run with: sudo setcap cap_sys_nice+ep <binary> for real-time scheduling" << std::endl;
+                        EMU_LOG << "[EMU] Note: Real-time priority not available (need CAP_SYS_NICE or root)" << std::endl;
+                        EMU_LOG << "[EMU] Run with: sudo setcap cap_sys_nice+ep <binary> for real-time scheduling" << std::endl;
                     }
                 }
             }
@@ -1651,11 +1616,15 @@ void Emulator::emulator_thread_func() {
         }
 
         if (request) {
+#if EMU_LOGGING_ENABLED
             request->t_dequeued = std::chrono::steady_clock::now();
             request->t_exec_start = request->t_dequeued;  // Same for now
+#endif
             uint64_t result = call_function_internal(request->address, request->args,
                                                       request->is_safe_call);
+#if EMU_LOGGING_ENABLED
             request->t_exec_end = std::chrono::steady_clock::now();
+#endif
 
             // Store result and set completed atomically
             // Use acquire-release semantics to ensure result is visible before completed
@@ -1670,6 +1639,7 @@ void Emulator::emulator_thread_func() {
     EMU_LOG << "[EMU] Emulator thread exiting" << std::endl;
 }
 
+#if EMU_LOGGING_ENABLED
 // Profiling stats for call_function - granular breakdown
 static std::atomic<uint64_t> g_call_count{0};
 static std::atomic<uint64_t> g_total_alloc_ns{0};     // Time for shared_ptr allocation
@@ -1706,24 +1676,29 @@ static inline void update_max(std::atomic<uint64_t>& max_val, uint64_t val) {
     while (val > current &&
            !max_val.compare_exchange_weak(current, val, std::memory_order_relaxed));
 }
+#endif
 
 uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& args) {
     if (std::this_thread::get_id() == emulator_thread_id_) {
         return call_function_internal(address, args, false);
     }
 
+#if EMU_LOGGING_ENABLED
     // T0: Start timing
     auto t0 = std::chrono::steady_clock::now();
+#endif
 
     auto request = std::make_shared<FunctionRequest>();
     request->address = address;
     request->args = args;
     request->completed.store(false, std::memory_order_relaxed);
     request->is_safe_call = false;
-    request->t_submit = t0;
 
+#if EMU_LOGGING_ENABLED
+    request->t_submit = t0;
     // T1: After allocation
     auto t1 = std::chrono::steady_clock::now();
+#endif
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -1732,10 +1707,12 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
         // The race was: unlock -> emulator checks queue (sees old state) -> notify (lost)
         request_cv_.notify_one();
     }
-    request->t_queued = std::chrono::steady_clock::now();
 
+#if EMU_LOGGING_ENABLED
+    request->t_queued = std::chrono::steady_clock::now();
     // T2: After queue
     auto t2 = request->t_queued;
+#endif
 
     // Wait for completion with timeout to prevent deadlock
     {
@@ -1752,6 +1729,7 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
         }
     }
 
+#if EMU_LOGGING_ENABLED
     // T3: After completion
     auto t3 = std::chrono::steady_clock::now();
 
@@ -1811,29 +1789,30 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
         uint64_t spk_1ms = g_spikes_1ms.exchange(0, std::memory_order_relaxed);
 
         if (count > 0) {
-            std::cerr << "[EMU_PROFILE] " << count << " calls (" << std::fixed << std::setprecision(1)
-                      << (double)count / since_report << "/s)\n";
-            std::cerr << "  [AVG us] alloc=" << total_alloc / count / 1000.0
-                      << " queue=" << total_queue / count / 1000.0
-                      << " sched=" << total_sched / count / 1000.0
-                      << " exec=" << total_exec / count / 1000.0
-                      << " signal=" << total_signal / count / 1000.0
-                      << " TOTAL=" << total_rt / count / 1000.0 << "\n";
-            std::cerr << "  [MAX us] alloc=" << max_alloc / 1000.0
-                      << " queue=" << max_queue / 1000.0
-                      << " sched=" << max_sched / 1000.0
-                      << " exec=" << max_exec / 1000.0
-                      << " signal=" << max_signal / 1000.0
-                      << " TOTAL=" << max_rt / 1000.0 << "\n";
+            EMU_LOG << "[EMU_PROFILE] " << count << " calls (" << std::fixed << std::setprecision(1)
+                    << (double)count / since_report << "/s)\n";
+            EMU_LOG << "  [AVG us] alloc=" << total_alloc / count / 1000.0
+                    << " queue=" << total_queue / count / 1000.0
+                    << " sched=" << total_sched / count / 1000.0
+                    << " exec=" << total_exec / count / 1000.0
+                    << " signal=" << total_signal / count / 1000.0
+                    << " TOTAL=" << total_rt / count / 1000.0 << "\n";
+            EMU_LOG << "  [MAX us] alloc=" << max_alloc / 1000.0
+                    << " queue=" << max_queue / 1000.0
+                    << " sched=" << max_sched / 1000.0
+                    << " exec=" << max_exec / 1000.0
+                    << " signal=" << max_signal / 1000.0
+                    << " TOTAL=" << max_rt / 1000.0 << "\n";
             if (spk_100 + spk_200 + spk_500 + spk_1ms > 0) {
-                std::cerr << "  [SPIKES] 100-200us=" << spk_100
-                          << " 200-500us=" << spk_200
-                          << " 500us-1ms=" << spk_500
-                          << " >1ms=" << spk_1ms << "\n";
+                EMU_LOG << "  [SPIKES] 100-200us=" << spk_100
+                        << " 200-500us=" << spk_200
+                        << " 500us-1ms=" << spk_500
+                        << " >1ms=" << spk_1ms << "\n";
             }
         }
         g_last_profile_report = now;
     }
+#endif
 
     return request->result;
 }

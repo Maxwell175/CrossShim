@@ -199,7 +199,6 @@ private:
 
     // QEMU hook IDs
     size_t syscall_hook_id_ = 0;
-    size_t block_hook_id_ = 0;
     size_t thread_hook_id_ = 0;
 
     std::unique_ptr<MemoryManager> memory_;

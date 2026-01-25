@@ -753,7 +753,6 @@ void register_hle_io(HleManager& hle) {
             std::cout.flush();
         } else if (fd == 2) {
             EMU_LOG << output;
-            std::cerr.flush();
         } else {
             auto it = g_file_map.find(fd);
             if (it != g_file_map.end()) {

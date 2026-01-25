@@ -72,7 +72,7 @@ void register_hle_mem_ops(HleManager& hle) {
                 emu.mem_write(dest, buf.data(), n);
             }
         } else if (n > MAX_MEMMOVE_SIZE) {
-            fprintf(stderr, "[HLE] memmove: size %lu exceeds max, ignoring\n", (unsigned long)n);
+            EMU_LOG << "[HLE] memmove: size " << n << " exceeds max, ignoring" << std::endl;
         }
         set_reg(emu, UC_ARM64_REG_X0, dest);
     });
@@ -93,7 +93,7 @@ void register_hle_mem_ops(HleManager& hle) {
                 emu.mem_write(s, buf.data(), n);
             }
         } else if (n > MAX_MEMSET_SIZE) {
-            fprintf(stderr, "[HLE] memset: size %lu exceeds max, ignoring\n", (unsigned long)n);
+            EMU_LOG << "[HLE] memset: size " << n << " exceeds max, ignoring" << std::endl;
         }
         set_reg(emu, UC_ARM64_REG_X0, s);
     });
@@ -117,7 +117,7 @@ void register_hle_mem_ops(HleManager& hle) {
                 result = memcmp(buf1.data(), buf2.data(), n);
             }
         } else if (n > MAX_MEMCMP_SIZE) {
-            fprintf(stderr, "[HLE] memcmp: size %lu exceeds max, returning 0\n", (unsigned long)n);
+            EMU_LOG << "[HLE] memcmp: size " << n << " exceeds max, returning 0" << std::endl;
         }
         set_reg(emu, UC_ARM64_REG_X0, result);
     });

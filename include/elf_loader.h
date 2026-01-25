@@ -76,8 +76,7 @@ public:
     // Get relocations
     std::vector<RelocationInfo> get_relocations() const;
     
-    // Get init/fini arrays
-    std::vector<uint64_t> get_init_array() const;  // Deprecated - use get_init_array_info()
+    // Get fini array
     std::vector<uint64_t> get_fini_array() const;
 
     // Get INIT_ARRAY address and size (returns {address, size})
