@@ -1053,9 +1053,21 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t key_ptr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t destructor = get_reg(emu, UC_ARM64_REG_X1);
 
+        // Defensive null check - invalid key_ptr would crash
+        if (key_ptr == 0 || key_ptr < 0x1000) {
+            set_reg(emu, UC_ARM64_REG_X0, EINVAL);
+            return;
+        }
+
         uint64_t key = g_next_tls_key.fetch_add(1);
         uint32_t key32 = static_cast<uint32_t>(key);
-        emu.mem_write(key_ptr, &key32, sizeof(key32));
+
+        try {
+            emu.mem_write(key_ptr, &key32, sizeof(key32));
+        } catch (...) {
+            set_reg(emu, UC_ARM64_REG_X0, EFAULT);
+            return;
+        }
 
         if (destructor != 0) {
             std::lock_guard<std::mutex> lock(g_tls_mutex);

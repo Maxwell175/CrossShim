@@ -249,10 +249,17 @@ private:
         uint64_t address;
         std::vector<uint64_t> args;
         uint64_t result;
-        bool completed;
+        std::atomic<bool> completed{false};  // Use atomic for spin-wait
         bool is_safe_call;  // Whether this is a call_function_safe
         std::mutex mutex;
         std::condition_variable cv;
+
+        // Profiling timestamps for latency spike analysis
+        std::chrono::steady_clock::time_point t_submit;      // When request was created
+        std::chrono::steady_clock::time_point t_queued;      // After queue push
+        std::chrono::steady_clock::time_point t_dequeued;    // When emulator thread picked it up
+        std::chrono::steady_clock::time_point t_exec_start;  // Before call_function_internal
+        std::chrono::steady_clock::time_point t_exec_end;    // After call_function_internal
     };
 
     std::thread emulator_thread_;

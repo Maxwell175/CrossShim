@@ -39,6 +39,9 @@
 #include <signal.h>
 #include <execinfo.h>
 #include <cxxabi.h>
+#include <sched.h>
+#include <pthread.h>
+#include <cerrno>
 
 // Path to QEMU stub binary
 static const char* QEMU_STUB_PATH = nullptr;
@@ -402,8 +405,15 @@ static libafl_syshook_ret pre_syscall_hook(
     uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
     uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t arg7) {
 
-    Emulator* emu = reinterpret_cast<Emulator*>(data);
     libafl_syshook_ret ret;
+
+    // Defensive check: validate data pointer
+    if (data == 0) {
+        ret.tag = LIBAFL_SYSHOOK_RUN;
+        return ret;
+    }
+
+    Emulator* emu = reinterpret_cast<Emulator*>(data);
 
     // Debug: Check for garbage syscall numbers
     if (sys_num < 0 || (sys_num > 1000 && sys_num < 0x1000)) {
@@ -420,6 +430,11 @@ static libafl_syshook_ret pre_syscall_hook(
 
     // Get current SP to identify thread
     CPUState* hook_cpu = libafl_qemu_current_cpu();
+    if (!hook_cpu) {
+        // CPU not available - let QEMU handle it
+        ret.tag = LIBAFL_SYSHOOK_RUN;
+        return ret;
+    }
     uint64_t hook_sp = qemu::read_reg(hook_cpu, qemu::REG_SP);
     uint64_t hook_pc = qemu::read_reg(hook_cpu, qemu::REG_PC);
 
@@ -515,7 +530,21 @@ static libafl_syshook_ret pre_syscall_hook(
             // multiple threads can call HLE handlers simultaneously. Each handler must
             // be internally thread-safe. Don't use g_hle_sync_mutex here as it causes
             // deadlock when blocking HLE calls (like usleep) prevent other threads.
-            emu->hle().handle_with_cpu(cached_cpu, hle_addr);
+            try {
+                emu->hle().handle_with_cpu(cached_cpu, hle_addr);
+            } catch (const std::exception& e) {
+                EMU_LOG << "[HLE_SYSCALL] Exception in HLE handler 0x" << std::hex
+                          << hle_addr << ": " << e.what() << std::dec << std::endl;
+                ret.tag = LIBAFL_SYSHOOK_SKIP;
+                ret.syshook_skip_retval = -1;
+                return ret;
+            } catch (...) {
+                EMU_LOG << "[HLE_SYSCALL] Unknown exception in HLE handler 0x" << std::hex
+                          << hle_addr << std::dec << std::endl;
+                ret.tag = LIBAFL_SYSHOOK_SKIP;
+                ret.syshook_skip_retval = -1;
+                return ret;
+            }
 
             // Return the value from X0 (set by the HLE handler)
             // Use the SAME cached CPU pointer - don't call libafl_qemu_current_cpu() again
@@ -1553,10 +1582,53 @@ void Emulator::emulator_thread_func() {
     // If QEMU is not yet initialized, we need to initialize it on this thread
     // This is critical: libafl_qemu_run() must be called from the same thread
     // that called libafl_qemu_init()
+    // NOTE: QEMU must be initialized BEFORE setting real-time scheduling,
+    // otherwise QEMU's internal initialization may not complete properly.
     if (!qemu_initialized_) {
         EMU_LOG << "[EMU] Initializing QEMU from emulator thread..." << std::endl;
         initialize_qemu_on_this_thread();
         EMU_LOG << "[EMU] QEMU initialized on emulator thread" << std::endl;
+    }
+
+    // Configure thread for low-latency operation AFTER QEMU is initialized:
+    // Try to set real-time scheduling (SCHED_FIFO) for predictable wakeup
+    // Note: CPU pinning was tested but found to HURT performance by preventing
+    // the scheduler from optimally placing the thread
+    // Note: Setting real-time priority before QEMU init causes crashes
+    // Set EMU_NO_REALTIME=1 to disable real-time scheduling
+    {
+        const char* no_realtime = std::getenv("EMU_NO_REALTIME");
+        if (no_realtime && (std::string(no_realtime) == "1" || std::string(no_realtime) == "true")) {
+            std::cerr << "[EMU] Real-time scheduling disabled via EMU_NO_REALTIME" << std::endl;
+        } else {
+            pthread_t self = pthread_self();
+
+            // Try to set SCHED_FIFO with priority 50 (mid-range, 1-99)
+            // This requires CAP_SYS_NICE or root privileges
+            struct sched_param param;
+            param.sched_priority = 50;
+            int ret = pthread_setschedparam(self, SCHED_FIFO, &param);
+            if (ret == 0) {
+                std::cerr << "[EMU] Set SCHED_FIFO priority 50 for emulator thread" << std::endl;
+            } else {
+                // Fall back: try SCHED_RR (round-robin real-time)
+                ret = pthread_setschedparam(self, SCHED_RR, &param);
+                if (ret == 0) {
+                    std::cerr << "[EMU] Set SCHED_RR priority 50 for emulator thread" << std::endl;
+                } else {
+                    // Can't get real-time, at least try to raise nice priority
+                    // nice(-10) requires CAP_SYS_NICE or being in an appropriate group
+                    errno = 0;
+                    int new_nice = nice(-10);
+                    if (errno == 0) {
+                        std::cerr << "[EMU] Set nice=" << new_nice << " for emulator thread" << std::endl;
+                    } else {
+                        std::cerr << "[EMU] Note: Real-time priority not available (need CAP_SYS_NICE or root)" << std::endl;
+                        std::cerr << "[EMU] Run with: sudo setcap cap_sys_nice+ep <binary> for real-time scheduling" << std::endl;
+                    }
+                }
+            }
+        }
     }
 
     // No need to register with TCG - we ARE the main QEMU thread now
@@ -1579,13 +1651,18 @@ void Emulator::emulator_thread_func() {
         }
 
         if (request) {
+            request->t_dequeued = std::chrono::steady_clock::now();
+            request->t_exec_start = request->t_dequeued;  // Same for now
             uint64_t result = call_function_internal(request->address, request->args,
                                                       request->is_safe_call);
-            {
-                std::lock_guard<std::mutex> lock(request->mutex);
-                request->result = result;
-                request->completed = true;
-            }
+            request->t_exec_end = std::chrono::steady_clock::now();
+
+            // Store result and set completed atomically
+            // Use acquire-release semantics to ensure result is visible before completed
+            request->result = result;
+            request->completed.store(true, std::memory_order_release);
+
+            // Still notify for callers that fell through to CV wait
             request->cv.notify_one();
         }
     }
@@ -1593,67 +1670,167 @@ void Emulator::emulator_thread_func() {
     EMU_LOG << "[EMU] Emulator thread exiting" << std::endl;
 }
 
-// Profiling stats for call_function
+// Profiling stats for call_function - granular breakdown
 static std::atomic<uint64_t> g_call_count{0};
-static std::atomic<uint64_t> g_total_queue_wait_ns{0};
-static std::atomic<uint64_t> g_total_exec_ns{0};
-static std::atomic<uint64_t> g_max_queue_wait_ns{0};
+static std::atomic<uint64_t> g_total_alloc_ns{0};     // Time for shared_ptr allocation
+static std::atomic<uint64_t> g_total_queue_ns{0};     // Time waiting for queue mutex
+static std::atomic<uint64_t> g_total_sched_ns{0};     // Time for scheduler wakeup
+static std::atomic<uint64_t> g_total_exec_ns{0};      // Time for actual execution
+static std::atomic<uint64_t> g_total_signal_ns{0};    // Time for result signal
+static std::atomic<uint64_t> g_total_roundtrip_ns{0}; // Total round-trip
+
+// Max values for each phase
+static std::atomic<uint64_t> g_max_alloc_ns{0};
+static std::atomic<uint64_t> g_max_queue_ns{0};
+static std::atomic<uint64_t> g_max_sched_ns{0};
 static std::atomic<uint64_t> g_max_exec_ns{0};
+static std::atomic<uint64_t> g_max_signal_ns{0};
+static std::atomic<uint64_t> g_max_roundtrip_ns{0};
+
+// Histogram for spikes (>100us)
+static std::atomic<uint64_t> g_spikes_100us{0};   // 100-200us
+static std::atomic<uint64_t> g_spikes_200us{0};   // 200-500us
+static std::atomic<uint64_t> g_spikes_500us{0};   // 500us-1ms
+static std::atomic<uint64_t> g_spikes_1ms{0};     // >1ms
+
+// Spin-wait effectiveness counters
+static std::atomic<uint64_t> g_spin_hits{0};      // Completed during spin phase
+static std::atomic<uint64_t> g_yield_hits{0};     // Completed during yield phase
+static std::atomic<uint64_t> g_cv_waits{0};       // Had to use CV wait
+
 static std::chrono::steady_clock::time_point g_last_profile_report = std::chrono::steady_clock::now();
+
+// Helper to update max atomically
+static inline void update_max(std::atomic<uint64_t>& max_val, uint64_t val) {
+    uint64_t current = max_val.load(std::memory_order_relaxed);
+    while (val > current &&
+           !max_val.compare_exchange_weak(current, val, std::memory_order_relaxed));
+}
 
 uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& args) {
     if (std::this_thread::get_id() == emulator_thread_id_) {
         return call_function_internal(address, args, false);
     }
 
+    // T0: Start timing
+    auto t0 = std::chrono::steady_clock::now();
+
     auto request = std::make_shared<FunctionRequest>();
     request->address = address;
     request->args = args;
-    request->completed = false;
+    request->completed.store(false, std::memory_order_relaxed);
     request->is_safe_call = false;
+    request->t_submit = t0;
 
-    // Record submit time for profiling
-    auto submit_time = std::chrono::steady_clock::now();
+    // T1: After allocation
+    auto t1 = std::chrono::steady_clock::now();
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         request_queue_.push(request);
+        // CRITICAL: Notify WHILE holding the lock to prevent lost wakeups.
+        // The race was: unlock -> emulator checks queue (sees old state) -> notify (lost)
+        request_cv_.notify_one();
     }
-    request_cv_.notify_one();
+    request->t_queued = std::chrono::steady_clock::now();
 
+    // T2: After queue
+    auto t2 = request->t_queued;
+
+    // Wait for completion with timeout to prevent deadlock
     {
         std::unique_lock<std::mutex> lock(request->mutex);
-        request->cv.wait(lock, [&request] { return request->completed; });
+        // Use wait_for with 30 second timeout to prevent permanent deadlock
+        bool completed = request->cv.wait_for(lock, std::chrono::seconds(30), [&request] {
+            return request->completed.load(std::memory_order_acquire);
+        });
+        if (!completed) {
+            EMU_LOG << "[EMU] TIMEOUT: call_function request timed out after 30s! addr=0x"
+                    << std::hex << request->address << std::dec << std::endl;
+            // Return error code to prevent permanent hang
+            return (uint64_t)-1;
+        }
     }
 
-    // Calculate timing
-    auto end_time = std::chrono::steady_clock::now();
-    uint64_t total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - submit_time).count();
+    // T3: After completion
+    auto t3 = std::chrono::steady_clock::now();
 
-    // Update stats atomically
+    // Calculate each phase
+    uint64_t alloc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    uint64_t queue_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+    uint64_t sched_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(request->t_dequeued - t2).count();
+    uint64_t exec_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(request->t_exec_end - request->t_exec_start).count();
+    uint64_t signal_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - request->t_exec_end).count();
+    uint64_t roundtrip_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count();
+
+    // Update stats
     g_call_count.fetch_add(1, std::memory_order_relaxed);
-    g_total_exec_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    g_total_alloc_ns.fetch_add(alloc_ns, std::memory_order_relaxed);
+    g_total_queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
+    g_total_sched_ns.fetch_add(sched_ns, std::memory_order_relaxed);
+    g_total_exec_ns.fetch_add(exec_ns, std::memory_order_relaxed);
+    g_total_signal_ns.fetch_add(signal_ns, std::memory_order_relaxed);
+    g_total_roundtrip_ns.fetch_add(roundtrip_ns, std::memory_order_relaxed);
 
-    // Update max (CAS loop)
-    uint64_t current_max = g_max_exec_ns.load(std::memory_order_relaxed);
-    while (total_ns > current_max &&
-           !g_max_exec_ns.compare_exchange_weak(current_max, total_ns, std::memory_order_relaxed));
+    // Update maxes
+    update_max(g_max_alloc_ns, alloc_ns);
+    update_max(g_max_queue_ns, queue_ns);
+    update_max(g_max_sched_ns, sched_ns);
+    update_max(g_max_exec_ns, exec_ns);
+    update_max(g_max_signal_ns, signal_ns);
+    update_max(g_max_roundtrip_ns, roundtrip_ns);
+
+    // Track spike histogram
+    if (roundtrip_ns > 1000000) g_spikes_1ms.fetch_add(1, std::memory_order_relaxed);
+    else if (roundtrip_ns > 500000) g_spikes_500us.fetch_add(1, std::memory_order_relaxed);
+    else if (roundtrip_ns > 200000) g_spikes_200us.fetch_add(1, std::memory_order_relaxed);
+    else if (roundtrip_ns > 100000) g_spikes_100us.fetch_add(1, std::memory_order_relaxed);
 
     // Report stats every 5 seconds
     auto now = std::chrono::steady_clock::now();
     auto since_report = std::chrono::duration_cast<std::chrono::seconds>(now - g_last_profile_report).count();
     if (since_report >= 5) {
         uint64_t count = g_call_count.exchange(0, std::memory_order_relaxed);
-        uint64_t total = g_total_exec_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t total_alloc = g_total_alloc_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t total_queue = g_total_queue_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t total_sched = g_total_sched_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t total_exec = g_total_exec_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t total_signal = g_total_signal_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t total_rt = g_total_roundtrip_ns.exchange(0, std::memory_order_relaxed);
+
+        uint64_t max_alloc = g_max_alloc_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t max_queue = g_max_queue_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t max_sched = g_max_sched_ns.exchange(0, std::memory_order_relaxed);
         uint64_t max_exec = g_max_exec_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t max_signal = g_max_signal_ns.exchange(0, std::memory_order_relaxed);
+        uint64_t max_rt = g_max_roundtrip_ns.exchange(0, std::memory_order_relaxed);
+
+        uint64_t spk_100 = g_spikes_100us.exchange(0, std::memory_order_relaxed);
+        uint64_t spk_200 = g_spikes_200us.exchange(0, std::memory_order_relaxed);
+        uint64_t spk_500 = g_spikes_500us.exchange(0, std::memory_order_relaxed);
+        uint64_t spk_1ms = g_spikes_1ms.exchange(0, std::memory_order_relaxed);
 
         if (count > 0) {
-            double avg_us = (double)total / count / 1000.0;
-            double max_us = max_exec / 1000.0;
-            double calls_per_sec = (double)count / since_report;
-            std::cerr << "[EMU_PROFILE] " << count << " calls in " << since_report << "s"
-                      << " (" << std::fixed << std::setprecision(1) << calls_per_sec << "/s)"
-                      << " avg=" << avg_us << "us max=" << max_us << "us" << std::endl;
+            std::cerr << "[EMU_PROFILE] " << count << " calls (" << std::fixed << std::setprecision(1)
+                      << (double)count / since_report << "/s)\n";
+            std::cerr << "  [AVG us] alloc=" << total_alloc / count / 1000.0
+                      << " queue=" << total_queue / count / 1000.0
+                      << " sched=" << total_sched / count / 1000.0
+                      << " exec=" << total_exec / count / 1000.0
+                      << " signal=" << total_signal / count / 1000.0
+                      << " TOTAL=" << total_rt / count / 1000.0 << "\n";
+            std::cerr << "  [MAX us] alloc=" << max_alloc / 1000.0
+                      << " queue=" << max_queue / 1000.0
+                      << " sched=" << max_sched / 1000.0
+                      << " exec=" << max_exec / 1000.0
+                      << " signal=" << max_signal / 1000.0
+                      << " TOTAL=" << max_rt / 1000.0 << "\n";
+            if (spk_100 + spk_200 + spk_500 + spk_1ms > 0) {
+                std::cerr << "  [SPIKES] 100-200us=" << spk_100
+                          << " 200-500us=" << spk_200
+                          << " 500us-1ms=" << spk_500
+                          << " >1ms=" << spk_1ms << "\n";
+            }
         }
         g_last_profile_report = now;
     }
@@ -1672,18 +1849,27 @@ uint64_t Emulator::call_function_safe(uint64_t address, const std::vector<uint64
     auto request = std::make_shared<FunctionRequest>();
     request->address = address;
     request->args = args;
-    request->completed = false;
+    request->completed.store(false, std::memory_order_relaxed);
     request->is_safe_call = true;
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         request_queue_.push(request);
+        // CRITICAL: Notify WHILE holding the lock to prevent lost wakeups
+        request_cv_.notify_one();
     }
-    request_cv_.notify_one();
 
     {
         std::unique_lock<std::mutex> lock(request->mutex);
-        request->cv.wait(lock, [&request] { return request->completed; });
+        // Use wait_for with 30 second timeout to prevent permanent deadlock
+        bool completed = request->cv.wait_for(lock, std::chrono::seconds(30), [&request] {
+            return request->completed.load(std::memory_order_acquire);
+        });
+        if (!completed) {
+            EMU_LOG << "[EMU] TIMEOUT: call_function_safe request timed out after 30s! addr=0x"
+                    << std::hex << request->address << std::dec << std::endl;
+            return (uint64_t)-1;
+        }
     }
 
     return request->result;

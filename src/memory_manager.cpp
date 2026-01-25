@@ -250,6 +250,12 @@ void MemoryManager::set_qemu_ready(uint64_t base) {
         }
 
         // Copy data from host memory to guest memory
+        // Skip copy for address 0 when guest_base=0 - host address 0 is unmappable (null page)
+        if (guest_base_ == 0 && region.address == 0) {
+            EMU_LOG << "[MEM] Skipping copy for region at address 0 (null page)" << std::endl;
+            continue;
+        }
+
         int err = cpu_memory_rw_debug(cpu, region.address, region.host_ptr, region.size, 1);
         if (err != 0) {
             EMU_LOG << "[MEM] WARNING: Failed to copy region " << region.name
