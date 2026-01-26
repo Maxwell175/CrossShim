@@ -89,21 +89,21 @@ static void test_strtod(void) {
     char *endptr;
     double d;
     float f;
-    
+
     printf("\n=== strtod/strtof Tests ===\n");
-    
+
     d = strtod("3.14159", &endptr);
     TEST_ASSERT(d > 3.14 && d < 3.15, "strtod basic");
-    
+
     d = strtod("-2.5e10", &endptr);
     TEST_ASSERT(d < -2.4e10 && d > -2.6e10, "strtod scientific");
-    
+
     d = strtod("1.5E-5", &endptr);
     TEST_ASSERT(d > 1.4e-5 && d < 1.6e-5, "strtod small exponent");
-    
+
     d = strtod("  42.0abc", &endptr);
     TEST_ASSERT(d == 42.0 && strcmp(endptr, "abc") == 0, "strtod with endptr");
-    
+
     f = strtof("3.14", &endptr);
     TEST_ASSERT(f > 3.13f && f < 3.15f, "strtof basic");
 }

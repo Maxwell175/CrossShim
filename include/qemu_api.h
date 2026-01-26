@@ -414,7 +414,14 @@ bool libafl_get_return_on_crash(void);
 
 namespace qemu {
 
-// These match LibAFL QEMU's register numbering for AArch64
+// =============================================================================
+// ARM64 GDB Register Numbering
+// =============================================================================
+// QEMU's GDB interface uses a flat namespace with coprocessors appended:
+// - Core registers: 0-33 (X0-X30, SP, PC, CPSR)
+// - FPU coprocessor: 34-67 (V0-V31, FPSR, FPCR)
+// - TLS coprocessor: 68-69 (TPIDR_EL0, TPIDR2_EL0)
+
 enum Arm64Reg {
     // General purpose registers (X0-X30)
     REG_X0 = 0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5, REG_X6, REG_X7,
@@ -424,45 +431,49 @@ enum Arm64Reg {
     REG_SP = 31,   // Stack pointer
     REG_PC = 32,   // Program counter
     REG_CPSR = 33, // Condition flags (PSTATE/NZCV)
-    REG_TPIDR_EL0 = 34, // Thread-local storage pointer
 
-    // SIMD/FP registers start at 64 (V0-V31 are 128-bit each)
-    REG_V0 = 64,
-    REG_V1 = 65,
-    REG_V2 = 66,
-    REG_V3 = 67,
-    REG_V4 = 68,
-    REG_V5 = 69,
-    REG_V6 = 70,
-    REG_V7 = 71,
-    REG_V8 = 72,
-    REG_V9 = 73,
-    REG_V10 = 74,
-    REG_V11 = 75,
-    REG_V12 = 76,
-    REG_V13 = 77,
-    REG_V14 = 78,
-    REG_V15 = 79,
-    REG_V16 = 80,
-    REG_V17 = 81,
-    REG_V18 = 82,
-    REG_V19 = 83,
-    REG_V20 = 84,
-    REG_V21 = 85,
-    REG_V22 = 86,
-    REG_V23 = 87,
-    REG_V24 = 88,
-    REG_V25 = 89,
-    REG_V26 = 90,
-    REG_V27 = 91,
-    REG_V28 = 92,
-    REG_V29 = 93,
-    REG_V30 = 94,
-    REG_V31 = 95,
+    // SIMD/FP registers (V0-V31 are 128-bit each)
+    // FPU coprocessor starts at index 34 after core registers
+    REG_V0 = 34,
+    REG_V1 = 35,
+    REG_V2 = 36,
+    REG_V3 = 37,
+    REG_V4 = 38,
+    REG_V5 = 39,
+    REG_V6 = 40,
+    REG_V7 = 41,
+    REG_V8 = 42,
+    REG_V9 = 43,
+    REG_V10 = 44,
+    REG_V11 = 45,
+    REG_V12 = 46,
+    REG_V13 = 47,
+    REG_V14 = 48,
+    REG_V15 = 49,
+    REG_V16 = 50,
+    REG_V17 = 51,
+    REG_V18 = 52,
+    REG_V19 = 53,
+    REG_V20 = 54,
+    REG_V21 = 55,
+    REG_V22 = 56,
+    REG_V23 = 57,
+    REG_V24 = 58,
+    REG_V25 = 59,
+    REG_V26 = 60,
+    REG_V27 = 61,
+    REG_V28 = 62,
+    REG_V29 = 63,
+    REG_V30 = 64,
+    REG_V31 = 65,
 
     // Floating-point control/status registers
-    REG_FPCR = 96,
-    REG_FPSR = 97,
+    REG_FPSR = 66,
+    REG_FPCR = 67,
+
+    // TLS coprocessor (starts after FPU)
+    REG_TPIDR_EL0 = 68,
+    REG_TPIDR2_EL0 = 69,
 
     // Aliases
     REG_FP = REG_X29,  // Frame pointer

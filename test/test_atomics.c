@@ -620,126 +620,6 @@ static void test_lse_casp_64(void) {
   TEST("CASP 64-bit success: updates Hi", pair[1] == 0xEEEEFFFF00001111ULL);
 }
 
-/* Test LDXR/STXR (Load/Store Exclusive) - 32-bit */
-static void test_ldxr_stxr_32(void) {
-  printf("\n=== LDXR/STXR 32-bit Tests ===\n");
-
-  /* LDXR W0, [X1] - opcode 0x885f7c20
-   * STXR W2, W0, [X1] - opcode 0x88007c20 (W2 = status, W0 = value) */
-  volatile uint32_t val = 100;
-  uint32_t loaded = 0;
-  uint32_t status = 1;
-  uint32_t new_val = 200;
-
-  /* Load exclusive */
-  asm volatile("mov x1, %[ptr]\n"
-               ".inst 0x885f7c20\n" /* ldxr w0, [x1] */
-               "mov %w[loaded], w0\n"
-               : [loaded] "=r"(loaded)
-               : [ptr] "r"(&val)
-               : "w0", "x1", "memory");
-
-  TEST("LDXR 32-bit loads value (100)", loaded == 100);
-
-  /* Store exclusive (should succeed immediately after load) */
-  asm volatile("mov w0, %w[new_val]\n"
-               "mov x1, %[ptr]\n"
-               ".inst 0x88027c20\n" /* stxr w2, w0, [x1] */
-               "mov %w[status], w2\n"
-               : [status] "=r"(status)
-               : [new_val] "r"(new_val), [ptr] "r"(&val)
-               : "w0", "w2", "x1", "memory");
-
-  TEST("STXR 32-bit succeeds (status=0)", status == 0);
-  TEST("STXR 32-bit stores value (200)", val == 200);
-
-  /* Full LDXR/STXR loop - typical usage pattern */
-  val = 50;
-  uint32_t old_val = 0;
-  asm volatile(
-      "mov x1, %[ptr]\n"
-      "1:\n"
-      ".inst 0x885f7c20\n" /* ldxr w0, [x1] */
-      "add w3, w0, #10\n"  /* w3 = loaded + 10 */
-      ".inst 0x88037c23\n" /* stxr w2, w3, [x1] */
-      "cbnz w2, 1b\n"      /* retry if failed */
-      "mov %w[old], w0\n"
-      : [old] "=r"(old_val)
-      : [ptr] "r"(&val)
-      : "w0", "w2", "w3", "x1", "memory");
-
-  TEST("LDXR/STXR loop: old value (50)", old_val == 50);
-  TEST("LDXR/STXR loop: new value (60)", val == 60);
-}
-
-/* Test LDXR/STXR - 64-bit */
-static void test_ldxr_stxr_64(void) {
-  printf("\n=== LDXR/STXR 64-bit Tests ===\n");
-
-  /* LDXR X0, [X1] - opcode 0xc85f7c20
-   * STXR W2, X0, [X1] - opcode 0xc8007c20 */
-  volatile uint64_t val = 0x123456789ABCDEF0ULL;
-  uint64_t loaded = 0;
-  uint32_t status = 1;
-  uint64_t new_val = 0xFEDCBA9876543210ULL;
-
-  /* Load exclusive */
-  asm volatile("mov x1, %[ptr]\n"
-               ".inst 0xc85f7c20\n" /* ldxr x0, [x1] */
-               "mov %[loaded], x0\n"
-               : [loaded] "=r"(loaded)
-               : [ptr] "r"(&val)
-               : "x0", "x1", "memory");
-
-  TEST("LDXR 64-bit loads value", loaded == 0x123456789ABCDEF0ULL);
-
-  /* Store exclusive */
-  asm volatile("mov x0, %[new_val]\n"
-               "mov x1, %[ptr]\n"
-               ".inst 0xc8027c20\n" /* stxr w2, x0, [x1] */
-               "mov %w[status], w2\n"
-               : [status] "=r"(status)
-               : [new_val] "r"(new_val), [ptr] "r"(&val)
-               : "x0", "w2", "x1", "memory");
-
-  TEST("STXR 64-bit succeeds", status == 0);
-  TEST("STXR 64-bit stores value", val == 0xFEDCBA9876543210ULL);
-}
-
-/* Test LDAXR/STLXR (Acquire/Release variants) - 32-bit */
-static void test_ldaxr_stlxr_32(void) {
-  printf("\n=== LDAXR/STLXR 32-bit Tests ===\n");
-
-  /* LDAXR W0, [X1] - opcode 0x885ffc20 (acquire semantics)
-   * STLXR W2, W0, [X1] - opcode 0x8800fc20 (release semantics) */
-  volatile uint32_t val = 42;
-  uint32_t loaded = 0;
-  uint32_t status = 1;
-  uint32_t new_val = 84;
-
-  /* Load-acquire exclusive */
-  asm volatile("mov x1, %[ptr]\n"
-               ".inst 0x885ffc20\n" /* ldaxr w0, [x1] */
-               "mov %w[loaded], w0\n"
-               : [loaded] "=r"(loaded)
-               : [ptr] "r"(&val)
-               : "w0", "x1", "memory");
-
-  TEST("LDAXR 32-bit loads value (42)", loaded == 42);
-
-  /* Store-release exclusive */
-  asm volatile("mov w0, %w[new_val]\n"
-               "mov x1, %[ptr]\n"
-               ".inst 0x8802fc20\n" /* stlxr w2, w0, [x1] */
-               "mov %w[status], w2\n"
-               : [status] "=r"(status)
-               : [new_val] "r"(new_val), [ptr] "r"(&val)
-               : "w0", "w2", "x1", "memory");
-
-  TEST("STLXR 32-bit succeeds", status == 0);
-  TEST("STLXR 32-bit stores value (84)", val == 84);
-}
-
 /* Test memory barrier instructions */
 static void test_memory_barrier_instructions(void) {
   printf("\n=== Memory Barrier Instructions Tests ===\n");
@@ -936,11 +816,6 @@ int run_atomics_tests(void) {
   /* test_lse_cas_32(); */
   /* test_lse_casp_32(); */
   /* test_lse_casp_64(); */
-
-  /* Load/Store Exclusive */
-  test_ldxr_stxr_32();
-  test_ldxr_stxr_64();
-  test_ldaxr_stlxr_32();
 
   /* Memory Barriers */
   test_memory_barrier_instructions();

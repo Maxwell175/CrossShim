@@ -87,6 +87,8 @@ enum Arm64Syscall {
     SYS_RECVFROM        = 207,
     SYS_SETSOCKOPT      = 208,
     SYS_GETSOCKOPT      = 209,
+    SYS_EXECVE          = 221,
+    SYS_EXECVEAT        = 281,
 };
 
 // Virtual file descriptor
@@ -149,10 +151,17 @@ private:
     int64_t sys_recvfrom(int sockfd, uint64_t buf, size_t len, int flags, uint64_t src_addr, uint64_t addrlen);
     int64_t sys_setsockopt(int sockfd, int level, int optname, uint64_t optval, uint32_t optlen);
     int64_t sys_getsockopt(int sockfd, int level, int optname, uint64_t optval, uint64_t optlen);
+    int64_t sys_execve(uint64_t pathname, uint64_t argv, uint64_t envp);
+    int64_t sys_execveat(int dirfd, uint64_t pathname, uint64_t argv, uint64_t envp, int flags);
 
     // Helper functions
     std::string read_string(uint64_t address, size_t max_len = 4096);
     int allocate_fd();
+
+    // Exec helpers
+    bool is_arm64_elf(const std::string& path);
+    std::vector<std::string> read_string_array(uint64_t array_addr);
+    std::string get_cross_shim_path();
     
     // Futex helper functions
     int futex_wait(uint64_t uaddr, uint32_t val, uint32_t bitset, uint64_t timeout);

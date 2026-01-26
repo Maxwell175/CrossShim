@@ -8,65 +8,65 @@ namespace cross_shim {
 void register_libm_hle(HleManager& hle) {
     // Double precision math functions
     hle.register_function("sin", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, sin(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, sin(x));
     });
 
     hle.register_function("cos", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, cos(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, cos(x));
     });
 
     hle.register_function("tan", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, tan(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, tan(x));
     });
 
     hle.register_function("sqrt", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, sqrt(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, sqrt(x));
     });
 
     hle.register_function("pow", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, pow(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, pow(x, y));
     });
 
     hle.register_function("exp", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, exp(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, exp(x));
     });
 
     hle.register_function("log", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, log(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, log(x));
     });
 
     hle.register_function("log10", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, log10(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, log10(x));
     });
 
     hle.register_function("floor", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, floor(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, floor(x));
     });
 
     hle.register_function("ceil", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, ceil(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, ceil(x));
     });
 
     hle.register_function("fabs", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        set_dreg(emu, UC_ARM64_REG_D0, fabs(x));
+        double x = get_dreg(emu, 0);
+        set_dreg(emu, 0, fabs(x));
     });
 
     hle.register_function("fmod", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, fmod(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, fmod(x, y));
     });
 
     // Single precision math functions

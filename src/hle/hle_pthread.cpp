@@ -77,11 +77,12 @@ static thread_local uint64_t tl_current_thread_id = 0;
 // With QEMU MTTCG, threads run in parallel on real host threads.
 // We use real host std::mutex and std::condition_variable for synchronization.
 
-// Recursive mutex to support recursive locking patterns
+// Mutex that tracks ownership for proper trylock semantics
 struct HostMutex {
     std::recursive_mutex mtx;
     std::atomic<uint64_t> owner_thread{0};
     std::atomic<int> lock_count{0};
+    bool is_recursive{false};  // Track if mutex was init'd as recursive
 };
 
 // Map guest mutex address -> host mutex
@@ -532,6 +533,14 @@ void register_hle_pthread(HleManager& hle) {
         }
 
         auto mtx = get_or_create_mutex(mutex_addr);
+
+        // For non-recursive mutex: if already owned by this thread, return EBUSY
+        // (std::recursive_mutex would allow re-locking, but POSIX default mutex should not)
+        if (!mtx->is_recursive && mtx->owner_thread.load() == tid && mtx->lock_count.load() > 0) {
+            set_reg(emu, UC_ARM64_REG_X0, EBUSY);
+            return;
+        }
+
         if (mtx->mtx.try_lock()) {
             mtx->owner_thread.store(tid);
             mtx->lock_count++;

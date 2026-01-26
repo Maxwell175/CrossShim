@@ -22,27 +22,27 @@ void register_hle_math(HleManager& hle) {
     // ========================================================================
     
     hle.register_function("sin", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, sin(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, sin(get_dreg(emu, 0)));
     });
     hle.register_function("cos", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, cos(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, cos(get_dreg(emu, 0)));
     });
     hle.register_function("tan", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, tan(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, tan(get_dreg(emu, 0)));
     });
     hle.register_function("asin", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, asin(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, asin(get_dreg(emu, 0)));
     });
     hle.register_function("acos", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, acos(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, acos(get_dreg(emu, 0)));
     });
     hle.register_function("atan", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, atan(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, atan(get_dreg(emu, 0)));
     });
     hle.register_function("atan2", [](Emulator& emu) {
-        double y = get_dreg(emu, UC_ARM64_REG_D0);
-        double x = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, atan2(y, x));
+        double y = get_dreg(emu, 0);
+        double x = get_dreg(emu, 1);
+        set_dreg(emu, 0, atan2(y, x));
     });
 
     // ========================================================================
@@ -50,22 +50,22 @@ void register_hle_math(HleManager& hle) {
     // ========================================================================
     
     hle.register_function("sinh", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, sinh(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, sinh(get_dreg(emu, 0)));
     });
     hle.register_function("cosh", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, cosh(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, cosh(get_dreg(emu, 0)));
     });
     hle.register_function("tanh", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, tanh(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, tanh(get_dreg(emu, 0)));
     });
     hle.register_function("asinh", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, asinh(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, asinh(get_dreg(emu, 0)));
     });
     hle.register_function("acosh", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, acosh(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, acosh(get_dreg(emu, 0)));
     });
     hle.register_function("atanh", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, atanh(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, atanh(get_dreg(emu, 0)));
     });
 
     // ========================================================================
@@ -73,25 +73,25 @@ void register_hle_math(HleManager& hle) {
     // ========================================================================
     
     hle.register_function("exp", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, exp(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, exp(get_dreg(emu, 0)));
     });
     hle.register_function("exp2", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, exp2(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, exp2(get_dreg(emu, 0)));
     });
     hle.register_function("expm1", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, expm1(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, expm1(get_dreg(emu, 0)));
     });
     hle.register_function("log", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, log(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, log(get_dreg(emu, 0)));
     });
     hle.register_function("log2", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, log2(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, log2(get_dreg(emu, 0)));
     });
     hle.register_function("log10", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, log10(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, log10(get_dreg(emu, 0)));
     });
     hle.register_function("log1p", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, log1p(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, log1p(get_dreg(emu, 0)));
     });
 
     // ========================================================================
@@ -99,20 +99,20 @@ void register_hle_math(HleManager& hle) {
     // ========================================================================
     
     hle.register_function("pow", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, pow(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, pow(x, y));
     });
     hle.register_function("sqrt", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, sqrt(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, sqrt(get_dreg(emu, 0)));
     });
     hle.register_function("cbrt", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, cbrt(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, cbrt(get_dreg(emu, 0)));
     });
     hle.register_function("hypot", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, hypot(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, hypot(x, y));
     });
 
     // ========================================================================
@@ -120,44 +120,44 @@ void register_hle_math(HleManager& hle) {
     // ========================================================================
 
     hle.register_function("floor", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, floor(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, floor(get_dreg(emu, 0)));
     });
     hle.register_function("ceil", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, ceil(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, ceil(get_dreg(emu, 0)));
     });
     hle.register_function("round", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, round(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, round(get_dreg(emu, 0)));
     });
     hle.register_function("trunc", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, trunc(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, trunc(get_dreg(emu, 0)));
     });
     hle.register_function("fabs", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, fabs(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, fabs(get_dreg(emu, 0)));
     });
     hle.register_function("fmod", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, fmod(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, fmod(x, y));
     });
     hle.register_function("remainder", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, remainder(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, remainder(x, y));
     });
     hle.register_function("fmin", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, fmin(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, fmin(x, y));
     });
     hle.register_function("fmax", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, fmax(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, fmax(x, y));
     });
     hle.register_function("copysign", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, copysign(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, copysign(x, y));
     });
 
     // ========================================================================
@@ -232,23 +232,23 @@ void register_hle_math(HleManager& hle) {
     // ========================================================================
 
     hle.register_function("ldexp", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
+        double x = get_dreg(emu, 0);
         uint64_t exp = get_reg(emu, UC_ARM64_REG_X0);
-        set_dreg(emu, UC_ARM64_REG_D0, ldexp(x, (int)exp));
+        set_dreg(emu, 0, ldexp(x, (int)exp));
     });
 
     hle.register_function("frexp", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
+        double x = get_dreg(emu, 0);
         int exp;
         double result = frexp(x, &exp);
-        set_dreg(emu, UC_ARM64_REG_D0, result);
+        set_dreg(emu, 0, result);
     });
 
     hle.register_function("modf", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
+        double x = get_dreg(emu, 0);
         double ipart;
         double result = modf(x, &ipart);
-        set_dreg(emu, UC_ARM64_REG_D0, result);
+        set_dreg(emu, 0, result);
     });
 
     hle.register_function("modff", [](Emulator& emu) {
@@ -272,9 +272,9 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("scalbn", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
+        double x = get_dreg(emu, 0);
         uint64_t n = get_reg(emu, UC_ARM64_REG_X0);
-        set_dreg(emu, UC_ARM64_REG_D0, scalbn(x, (int)n));
+        set_dreg(emu, 0, scalbn(x, (int)n));
     });
 
     hle.register_function("scalbnf", [](Emulator& emu) {
@@ -284,13 +284,13 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("scalbln", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
+        double x = get_dreg(emu, 0);
         uint64_t n = get_reg(emu, UC_ARM64_REG_X0);
-        set_dreg(emu, UC_ARM64_REG_D0, scalbln(x, (long)n));
+        set_dreg(emu, 0, scalbln(x, (long)n));
     });
 
     hle.register_function("ilogb", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
+        double x = get_dreg(emu, 0);
         uint64_t result = ilogb(x);
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
@@ -302,7 +302,7 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("logb", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, logb(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, logb(get_dreg(emu, 0)));
     });
 
     hle.register_function("logbf", [](Emulator& emu) {
@@ -310,9 +310,9 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("nextafter", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, nextafter(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, nextafter(x, y));
     });
 
     hle.register_function("nextafterf", [](Emulator& emu) {
@@ -322,9 +322,9 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("fdim", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        set_dreg(emu, UC_ARM64_REG_D0, fdim(x, y));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        set_dreg(emu, 0, fdim(x, y));
     });
 
     hle.register_function("fdimf", [](Emulator& emu) {
@@ -334,10 +334,10 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("fma", [](Emulator& emu) {
-        double x = get_dreg(emu, UC_ARM64_REG_D0);
-        double y = get_dreg(emu, UC_ARM64_REG_D1);
-        double z = get_dreg(emu, UC_ARM64_REG_D2);
-        set_dreg(emu, UC_ARM64_REG_D0, fma(x, y, z));
+        double x = get_dreg(emu, 0);
+        double y = get_dreg(emu, 1);
+        double z = get_dreg(emu, 2);
+        set_dreg(emu, 0, fma(x, y, z));
     });
 
     hle.register_function("fmaf", [](Emulator& emu) {
@@ -348,7 +348,7 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("nan", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, nan(""));
+        set_dreg(emu, 0, nan(""));
     });
 
     hle.register_function("nanf", [](Emulator& emu) {
@@ -356,7 +356,7 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("erf", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, erf(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, erf(get_dreg(emu, 0)));
     });
 
     hle.register_function("erff", [](Emulator& emu) {
@@ -364,7 +364,7 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("erfc", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, erfc(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, erfc(get_dreg(emu, 0)));
     });
 
     hle.register_function("erfcf", [](Emulator& emu) {
@@ -372,7 +372,7 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("lgamma", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, lgamma(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, lgamma(get_dreg(emu, 0)));
     });
 
     hle.register_function("lgammaf", [](Emulator& emu) {
@@ -380,7 +380,7 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("tgamma", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, tgamma(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, tgamma(get_dreg(emu, 0)));
     });
 
     hle.register_function("tgammaf", [](Emulator& emu) {
@@ -388,19 +388,19 @@ void register_hle_math(HleManager& hle) {
     });
 
     hle.register_function("j0", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, j0(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, j0(get_dreg(emu, 0)));
     });
 
     hle.register_function("j1", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, j1(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, j1(get_dreg(emu, 0)));
     });
 
     hle.register_function("y0", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, y0(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, y0(get_dreg(emu, 0)));
     });
 
     hle.register_function("y1", [](Emulator& emu) {
-        set_dreg(emu, UC_ARM64_REG_D0, y1(get_dreg(emu, UC_ARM64_REG_D0)));
+        set_dreg(emu, 0, y1(get_dreg(emu, 0)));
     });
 }
 

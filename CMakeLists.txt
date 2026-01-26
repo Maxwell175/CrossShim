@@ -148,21 +148,32 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CrossShim
 )
 
-# Option to build tests
-option(BUILD_TESTS "Build test executable" ON)
+# Standalone executable for running ARM64 binaries
+add_executable(cross_shim_runner src/cross_shim_runner.cpp)
+target_link_libraries(cross_shim_runner PRIVATE cross_shim)
+set_target_properties(cross_shim_runner PROPERTIES
+    OUTPUT_NAME cross_shim
+    # Set RPATH so the executable can find libqemu-aarch64.so
+    BUILD_RPATH "${QEMU_INSTALL_DIR}/lib"
+    INSTALL_RPATH "${QEMU_INSTALL_DIR}/lib"
+)
+
+# Install the runner executable
+install(TARGETS cross_shim_runner
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Option to enable CTest
+option(BUILD_TESTS "Enable CTest integration" ON)
 
 if(BUILD_TESTS)
-    add_executable(emu_test_runner test/emu_test_runner.cpp)
-    target_link_libraries(emu_test_runner PRIVATE cross_shim)
-
-    # Enable CTest
     enable_testing()
 
     # Add a test that runs the emulator test suite
-    # Note: This requires the ARM64 test binary to be built first via test/run_emulator_tests.sh
+    # Note: This requires ARM64 test binaries to be built first via test/build_individual_tests.sh
     add_test(
         NAME emulator_tests
-        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/run_emulator_tests.sh
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/run_individual_tests.sh
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()

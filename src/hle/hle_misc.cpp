@@ -13,6 +13,7 @@
 #include "emu_compat.h"
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <vector>
 #include <unordered_map>
 #include <random>
@@ -186,12 +187,8 @@ void register_hle_misc(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("strtod", [](Emulator& emu) {
-        uint64_t nptr = get_reg(emu, UC_ARM64_REG_X0);
-        std::string str = read_string(emu, nptr);
-        double result = strtod(str.c_str(), nullptr);
-        set_dreg(emu, 0, result);
-    });
+    // NOTE: strtod with full endptr support is registered later in this file
+    // See the strtof/strtod/strtold section around line 757
 
     // ========================================================================
     // Random numbers

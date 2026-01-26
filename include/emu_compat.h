@@ -11,6 +11,7 @@
 #include "cross_shim.h"
 #include "qemu_api.h"
 #include <cstring>
+#include <cstdio>
 
 namespace cross_shim {
 
@@ -36,12 +37,13 @@ inline void set_reg(Emulator& emu, int reg, uint64_t value) {
 }
 
 // Read a double-precision floating-point register (D0-D31 = lower 64 bits of V0-V31)
+// NOTE: QEMU's libafl_qemu_read_reg may read up to 256 bytes for FP registers
 inline double get_dreg(Emulator& emu, int reg) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return 0.0;
     // FP registers start at REG_V0 = 34
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[16] = {0};
+    uint8_t buf[512] = {0};  // Large buffer to avoid stack overflow
     libafl_qemu_read_reg(cpu, fp_reg, buf);
     double val;
     memcpy(&val, buf, sizeof(val));
@@ -49,22 +51,26 @@ inline double get_dreg(Emulator& emu, int reg) {
 }
 
 // Write a double-precision floating-point register
+// NOTE: QEMU's libafl_qemu_read_reg/write_reg writes 256 bytes (all FP regs)
+// when accessing FPU coprocessor registers, so we use a larger buffer.
 inline void set_dreg(Emulator& emu, int reg, double value) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return;
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[16] = {0};
-    libafl_qemu_read_reg(cpu, fp_reg, buf);  // Read full 128-bit register
-    memcpy(buf, &value, sizeof(value));      // Modify lower 64 bits
+    // QEMU writes 256 bytes (32 FP regs × 8 bytes) for FPU register access
+    uint8_t buf[512] = {0};
+    libafl_qemu_read_reg(cpu, fp_reg, buf);
+    memcpy(buf, &value, sizeof(value));  // Modify lower 64 bits of V[reg]
     libafl_qemu_write_reg(cpu, fp_reg, buf);
 }
 
 // Read a single-precision floating-point register (S0-S31 = lower 32 bits of V0-V31)
+// NOTE: QEMU's libafl_qemu_read_reg may read up to 256 bytes for FP registers
 inline float get_sreg(Emulator& emu, int reg) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return 0.0f;
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[16] = {0};
+    uint8_t buf[512] = {0};  // Large buffer to avoid stack overflow
     libafl_qemu_read_reg(cpu, fp_reg, buf);
     float val;
     memcpy(&val, buf, sizeof(val));
@@ -72,12 +78,13 @@ inline float get_sreg(Emulator& emu, int reg) {
 }
 
 // Write a single-precision floating-point register
+// NOTE: QEMU's libafl_qemu_read_reg/write_reg may read/write up to 256 bytes
 inline void set_sreg(Emulator& emu, int reg, float value) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return;
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[16] = {0};
-    libafl_qemu_read_reg(cpu, fp_reg, buf);  // Read full 128-bit register
+    uint8_t buf[512] = {0};  // Large buffer to avoid stack overflow
+    libafl_qemu_read_reg(cpu, fp_reg, buf);  // Read full register
     memcpy(buf, &value, sizeof(value));      // Modify lower 32 bits
     libafl_qemu_write_reg(cpu, fp_reg, buf);
 }
@@ -124,6 +131,7 @@ constexpr int UC_ARM64_REG_FP = qemu::REG_FP;
 constexpr int UC_ARM64_REG_NZCV = qemu::REG_CPSR;
 
 // SIMD/FP double register aliases (D0-D7 = lower 64 bits of V0-V7)
+// Note: These map to the FPU coprocessor registers starting at index 34
 constexpr int UC_ARM64_REG_D0 = qemu::REG_V0;
 constexpr int UC_ARM64_REG_D1 = qemu::REG_V1;
 constexpr int UC_ARM64_REG_D2 = qemu::REG_V2;
@@ -134,6 +142,7 @@ constexpr int UC_ARM64_REG_D6 = qemu::REG_V6;
 constexpr int UC_ARM64_REG_D7 = qemu::REG_V7;
 
 // SIMD/FP single register aliases (S0-S7 = lower 32 bits of V0-V7)
+// Note: These map to the same FPU registers - S and D share the V registers
 constexpr int UC_ARM64_REG_S0 = qemu::REG_V0;
 constexpr int UC_ARM64_REG_S1 = qemu::REG_V1;
 constexpr int UC_ARM64_REG_S2 = qemu::REG_V2;
@@ -181,9 +190,9 @@ constexpr int UC_ARM64_REG_Q29 = qemu::REG_V29;
 constexpr int UC_ARM64_REG_Q30 = qemu::REG_V30;
 constexpr int UC_ARM64_REG_Q31 = qemu::REG_V31;
 
-// Floating-point control/status registers
-constexpr int UC_ARM64_REG_FPCR = qemu::REG_FPCR;
+// Floating-point control/status registers (after V0-V31 in FPU coprocessor)
 constexpr int UC_ARM64_REG_FPSR = qemu::REG_FPSR;
+constexpr int UC_ARM64_REG_FPCR = qemu::REG_FPCR;
 
 // =============================================================================
 // Extended Register Access for 128-bit SIMD registers

@@ -7,6 +7,15 @@
 
 namespace cross_shim {
 
+// Strip version suffix from symbol name (e.g., "strtod@LIBC" -> "strtod")
+static std::string strip_version_suffix(const std::string& symbol_name) {
+    size_t at_pos = symbol_name.find('@');
+    if (at_pos != std::string::npos) {
+        return symbol_name.substr(0, at_pos);
+    }
+    return symbol_name;
+}
+
 RelocationHandler::RelocationHandler(MemoryManager& memory)
     : memory_(memory), processed_count_(0), failed_count_(0) {}
 
@@ -63,7 +72,11 @@ bool RelocationHandler::process_relocation(
         case R_AARCH64_ABS64: {
             uint64_t value = symbol_value;
             if (value == 0 && !symbol_name.empty() && resolver) {
+                // Try with original name first, then without version suffix
                 value = resolver(symbol_name);
+                if (value == 0) {
+                    value = resolver(strip_version_suffix(symbol_name));
+                }
             } else if (value != 0) {
                 value += base_address;
             }
@@ -77,7 +90,11 @@ bool RelocationHandler::process_relocation(
         case R_AARCH64_GLOB_DAT: {
             uint64_t value = symbol_value;
             if (value == 0 && !symbol_name.empty() && resolver) {
+                // Try with original name first, then without version suffix
                 value = resolver(symbol_name);
+                if (value == 0) {
+                    value = resolver(strip_version_suffix(symbol_name));
+                }
             } else if (value != 0) {
                 value += base_address;
             }
@@ -112,7 +129,11 @@ bool RelocationHandler::process_relocation(
             }
 
             if (value == 0 && !symbol_name.empty() && resolver) {
+                // Try with original name first, then without version suffix
                 value = resolver(symbol_name);
+                if (value == 0) {
+                    value = resolver(strip_version_suffix(symbol_name));
+                }
                 if (is_target_symbol) {
                     EMU_LOG << "[RELOC JUMP_SLOT] Resolved " << symbol_name
                              << " to 0x" << std::hex << value << std::dec << std::endl;
@@ -163,6 +184,11 @@ bool RelocationHandler::apply_glob_dat(uint64_t address, uint64_t value, int64_t
 
 bool RelocationHandler::apply_jump_slot(uint64_t address, uint64_t value, int64_t addend) {
     uint64_t result = value + addend;
+    // Debug: log HLE region writes
+    if (result >= 0x10000000 && result < 0x10100000) {
+        EMU_LOG << "[GOT_WRITE] Writing HLE addr 0x" << std::hex << result
+                  << " to GOT at 0x" << address << std::dec << std::endl;
+    }
     return memory_.write(address, &result, sizeof(result));
 }
 

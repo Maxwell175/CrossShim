@@ -8,8 +8,10 @@
 #include <ctime>
 #include <random>
 #include <iostream>
+#include <fstream>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <cerrno>
 
 namespace cross_shim {
@@ -177,6 +179,12 @@ void SyscallHandler::handle(uint64_t syscall_num) {
         case SYS_GETSOCKOPT:
             result = sys_getsockopt(args[0], args[1], args[2], args[3], args[4]);
             break;
+        case SYS_EXECVE:
+            result = sys_execve(args[0], args[1], args[2]);
+            break;
+        case SYS_EXECVEAT:
+            result = sys_execveat(static_cast<int>(args[0]), args[1], args[2], args[3], static_cast<int>(args[4]));
+            break;
         default:
             EMU_LOG << "[SYSCALL] Unhandled syscall: " << syscall_num << std::endl;
             result = -38;  // ENOSYS
@@ -329,8 +337,10 @@ int64_t SyscallHandler::sys_exit(int status) {
     if (logging_enabled_) {
         EMU_LOG << "[SYSCALL] exit(" << status << ")" << std::endl;
     }
+    // Store the exit status in X0 before stopping so it can be read by the caller
+    set_reg(emu_, UC_ARM64_REG_X0, static_cast<uint64_t>(status));
     emu_.stop();
-    return 0;
+    return status;  // Return the actual exit status
 }
 int64_t SyscallHandler::sys_futex(uint64_t uaddr, int op, uint32_t val,
                                    uint64_t timeout, uint64_t uaddr2, uint32_t val3) {
@@ -744,6 +754,175 @@ int64_t SyscallHandler::sys_getsockopt(int sockfd, int level, int optname, uint6
     memory_.write(optlen, &len32, 4);
 
     return 0;
+}
+
+bool SyscallHandler::is_arm64_elf(const std::string& path) {
+    // Check ELF header to determine if file is ARM64
+    // ELF header layout:
+    //   0-3: Magic (0x7f 'E' 'L' 'F')
+    //   4: Class (1=32-bit, 2=64-bit)
+    //   5: Endianness (1=LE, 2=BE)
+    //   16-17: Machine type (EM_AARCH64 = 183)
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+
+    uint8_t header[20];
+    if (!file.read(reinterpret_cast<char*>(header), sizeof(header))) {
+        return false;
+    }
+
+    // Check ELF magic
+    if (header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F') {
+        return false;
+    }
+
+    // Check 64-bit
+    if (header[4] != 2) {
+        return false;
+    }
+
+    // Check machine type (little-endian)
+    uint16_t machine = header[18] | (header[19] << 8);
+    return machine == 183;  // EM_AARCH64
+}
+
+std::vector<std::string> SyscallHandler::read_string_array(uint64_t array_addr) {
+    std::vector<std::string> result;
+    if (array_addr == 0) return result;
+
+    // Read array of pointers until NULL
+    while (true) {
+        uint64_t str_ptr = 0;
+        memory_.read(array_addr, &str_ptr, 8);
+        if (str_ptr == 0) break;
+
+        result.push_back(read_string(str_ptr));
+        array_addr += 8;
+    }
+
+    return result;
+}
+
+std::string SyscallHandler::get_cross_shim_path() {
+    // Check environment variable first
+    const char* env_path = getenv("CROSS_SHIM_PATH");
+    if (env_path && env_path[0] != '\0') {
+        return env_path;
+    }
+
+    // Try to get path from /proc/self/exe
+    char path[4096];
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (len > 0) {
+        path[len] = '\0';
+        return path;
+    }
+
+    // Fallback to searching PATH for cross_shim
+    return "cross_shim";
+}
+
+int64_t SyscallHandler::sys_execve(uint64_t pathname, uint64_t argv, uint64_t envp) {
+    std::string path = read_string(pathname);
+
+    EMU_LOG << "[SYSCALL] execve(\"" << path << "\", argv=0x" << std::hex << argv
+            << ", envp=0x" << envp << ")" << std::dec << std::endl;
+
+    // Check if the target is an ARM64 ELF
+    bool is_arm64 = is_arm64_elf(path);
+
+    // Read argv and envp arrays
+    std::vector<std::string> argv_vec = read_string_array(argv);
+    std::vector<std::string> envp_vec = read_string_array(envp);
+
+    EMU_LOG << "[SYSCALL] execve: target is " << (is_arm64 ? "ARM64" : "native")
+            << ", argc=" << argv_vec.size() << std::endl;
+
+    // Fork to create child process
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -errno;
+    }
+
+    if (pid == 0) {
+        // Child process
+        std::vector<char*> exec_argv;
+        std::vector<char*> exec_envp;
+
+        if (is_arm64) {
+            // Execute through cross_shim
+            std::string shim_path = get_cross_shim_path();
+            exec_argv.push_back(const_cast<char*>(shim_path.c_str()));
+            exec_argv.push_back(const_cast<char*>(path.c_str()));
+
+            // Add original argv (skip argv[0] since we're replacing it)
+            for (size_t i = 1; i < argv_vec.size(); i++) {
+                exec_argv.push_back(const_cast<char*>(argv_vec[i].c_str()));
+            }
+            exec_argv.push_back(nullptr);
+
+            // Copy environment
+            for (auto& env : envp_vec) {
+                exec_envp.push_back(const_cast<char*>(env.c_str()));
+            }
+            exec_envp.push_back(nullptr);
+
+            execve(shim_path.c_str(), exec_argv.data(), exec_envp.data());
+        } else {
+            // Execute native binary directly
+            for (auto& arg : argv_vec) {
+                exec_argv.push_back(const_cast<char*>(arg.c_str()));
+            }
+            exec_argv.push_back(nullptr);
+
+            for (auto& env : envp_vec) {
+                exec_envp.push_back(const_cast<char*>(env.c_str()));
+            }
+            exec_envp.push_back(nullptr);
+
+            execve(path.c_str(), exec_argv.data(), exec_envp.data());
+        }
+
+        // If execve returns, it failed
+        _exit(127);
+    }
+
+    // Parent process - wait for child
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status)) {
+        // Child exited normally - stop emulation and return its exit code
+        int exit_code = WEXITSTATUS(status);
+        EMU_LOG << "[SYSCALL] execve: child exited with code " << exit_code << std::endl;
+
+        // For exec semantics, we should not return - the process is replaced
+        // So we stop emulation with the child's exit code
+        emu_.stop();
+        return exit_code;
+    }
+
+    if (WIFSIGNALED(status)) {
+        int sig = WTERMSIG(status);
+        EMU_LOG << "[SYSCALL] execve: child killed by signal " << sig << std::endl;
+        emu_.stop();
+        return -sig;
+    }
+
+    return 0;
+}
+
+int64_t SyscallHandler::sys_execveat(int dirfd, uint64_t pathname, uint64_t argv, uint64_t envp, int flags) {
+    // For now, just delegate to execve (ignoring dirfd and flags)
+    // A full implementation would handle AT_FDCWD, AT_EMPTY_PATH, etc.
+    (void)dirfd;
+    (void)flags;
+
+    EMU_LOG << "[SYSCALL] execveat(dirfd=" << dirfd << ", flags=" << flags
+            << ") - delegating to execve" << std::endl;
+
+    return sys_execve(pathname, argv, envp);
 }
 
 } // namespace cross_shim
