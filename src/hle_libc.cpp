@@ -13,7 +13,7 @@ void register_libc_hle(HleManager& hle) {
     // Memory allocation
     hle.register_function("malloc", [](Emulator& emu) {
         uint64_t size = get_reg(emu, UC_ARM64_REG_X0);
-        uint64_t ptr = emu.memory().heap().allocate(size, 16);
+        uint64_t ptr = emu.memory().allocate_guest_memory(size, 16);
         if (ptr) emu.memory().zero(ptr, size);
         set_reg(emu, UC_ARM64_REG_X0, ptr);
     });
@@ -22,7 +22,7 @@ void register_libc_hle(HleManager& hle) {
         uint64_t nmemb = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t size = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t total = nmemb * size;
-        uint64_t ptr = emu.memory().heap().allocate(total, 16);
+        uint64_t ptr = emu.memory().allocate_guest_memory(total, 16);
         if (ptr) emu.memory().zero(ptr, total);
         set_reg(emu, UC_ARM64_REG_X0, ptr);
     });
@@ -30,13 +30,13 @@ void register_libc_hle(HleManager& hle) {
     hle.register_function("realloc", [](Emulator& emu) {
         uint64_t old_ptr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t new_size = get_reg(emu, UC_ARM64_REG_X1);
-        uint64_t new_ptr = emu.memory().heap().realloc(old_ptr, new_size);
+        uint64_t new_ptr = emu.memory().realloc_guest_memory(old_ptr, new_size);
         set_reg(emu, UC_ARM64_REG_X0, new_ptr);
     });
 
     hle.register_function("free", [](Emulator& emu) {
         uint64_t ptr = get_reg(emu, UC_ARM64_REG_X0);
-        if (ptr) emu.memory().heap().free(ptr);
+        if (ptr) emu.memory().free_guest_memory(ptr);
     });
 
     // String functions
@@ -138,10 +138,8 @@ void register_libc_hle(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, 1);
     });
 
-    // Error handling
-    hle.register_function("__errno", [](Emulator& emu) {
-        set_reg(emu, UC_ARM64_REG_X0, TLS_BASE + 0x10);  // Return errno location
-    });
+    // Error handling - __errno is implemented in hle_misc.cpp
+    // Using consistent address TLS_BASE + 0x100 = 0xC0000100
 
     hle.register_function("abort", [](Emulator& emu) {
         emu.stop();
@@ -149,4 +147,3 @@ void register_libc_hle(HleManager& hle) {
 }
 
 } // namespace cross_shim
-

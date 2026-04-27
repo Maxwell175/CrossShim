@@ -51,6 +51,17 @@ extern __thread CPUState* current_cpu;
 extern __thread CPUState* thread_cpu;  // Used by host_signal_handler!
 }
 
+namespace {
+
+constexpr uint64_t SAFE_CALL_STACK_BASE = 0xA0000000ULL;
+constexpr uint64_t SAFE_CALL_STACK_SIZE = 0x00800000ULL;
+constexpr uint64_t SAFE_CALL_STACK_CHUNK = 0x00100000ULL;
+constexpr uint64_t SAFE_CALL_TRAMPOLINE_ADDR = cross_shim::HLE_BASE + 0xFFF80ULL;
+constexpr uint64_t SAFE_CALL_CONTEXT_SIZE = 0x50ULL;
+
+}
+
+
 // Implementation of libafl_qemu_set_current_cpu
 extern "C" void libafl_qemu_set_current_cpu(CPUState* cpu) {
     current_cpu = cpu;
@@ -209,14 +220,16 @@ static void install_crash_handler() {
     EMU_LOG << "[DEBUG] Crash handler placeholder - actual wrapping after QEMU init" << std::endl;
 }
 
-// Library constructor - runs BEFORE main() when the library is loaded
-// This is critical because we need to block signals on the main thread
-// BEFORE .NET spawns any worker threads (which inherit the signal mask)
+// Library constructor - DISABLED for standalone use
+// The signal blocking interferes with QEMU's memory fault handling.
+// For .NET compatibility, the QEMU patches (pthread_key approach) handle thread safety.
+#if 0  // DISABLED - breaks QEMU signal handling
 __attribute__((constructor))
 static void library_init() {
     // Block signals on the main thread - all child threads will inherit this
     block_signals_on_host_threads();
 }
+#endif
 
 // =============================================================================
 // Debug: Instruction hooks for tracing execution
@@ -326,6 +339,16 @@ void register_hle_process(HleManager &hle);
 void register_hle_dir(HleManager &hle);
 void register_hle_syslog(HleManager &hle);
 void register_hle_user(HleManager &hle);
+// Split from hle_misc.cpp
+void register_hle_stdlib(HleManager &hle);
+void register_hle_wchar(HleManager &hle);
+void register_hle_locale(HleManager &hle);
+void register_hle_ctype(HleManager &hle);
+void register_hle_signal(HleManager &hle);
+void register_hle_search(HleManager &hle);
+void register_hle_sched(HleManager &hle);
+void register_hle_setjmp(HleManager &hle);
+void register_hle_sysconf(HleManager &hle);
 
 // Global emulator pointer for hook callbacks
 static Emulator* g_emulator = nullptr;
@@ -335,16 +358,16 @@ static thread_local CPUState* tls_cpu = nullptr;
 
 // Get the current CPU for this thread
 CPUState* get_current_cpu(Emulator& emu) {
-    // First try QEMU's current CPU for this host thread
-    // This is the most reliable way to get the correct CPU in MTTCG mode
-    // where each guest thread runs on a separate host thread
+    if (tls_cpu != nullptr) {
+        return tls_cpu;
+    }
+    // Fall back to QEMU's current CPU for this host thread.
+    // In MTTCG HLE callbacks we explicitly seed tls_cpu from the syscall hook;
+    // prefer that stable pointer over libafl_qemu_current_cpu(), which can race
+    // and occasionally report CPU 0 for a worker thread.
     CPUState* cpu = libafl_qemu_current_cpu();
     if (cpu != nullptr) {
         return cpu;
-    }
-    // Fall back to thread-local CPU if set
-    if (tls_cpu != nullptr) {
-        return tls_cpu;
     }
     // Last resort: use emulator's stored CPU (CPU 0)
     // NOTE: This happens during early initialization before QEMU is ready,
@@ -369,6 +392,7 @@ void notify_thread_exit(uint64_t sp, uint64_t retval);
 static constexpr int SYS_THREAD_DONE = 0x1234;
 static constexpr int SYS_THREAD_START = 0x1235;  // Debug marker
 static constexpr int SYS_CLONE_DEBUG = 0x1236;   // Debug after clone
+static constexpr int SYS_CLONE_CHILD_EXIT = 0x1237; // Exit helper for HLE clone children
 
 // HLE syscall base and mapping (defined in allocate_stub, used in pre_syscall_hook)
 static constexpr int HLE_SYSCALL_BASE = 0x2000;
@@ -429,7 +453,8 @@ static libafl_syshook_ret pre_syscall_hook(
 #if EMU_VERBOSE_LOGGING
     // Only log child thread syscalls (SP in 0x90xxxxxx range) or debug syscalls
     bool is_child_thread = (hook_sp >= 0x90000000 && hook_sp < 0x91000000);
-    bool is_debug_syscall = (sys_num == SYS_THREAD_DONE || sys_num == SYS_THREAD_START || sys_num == SYS_CLONE_DEBUG);
+    bool is_debug_syscall = (sys_num == SYS_THREAD_DONE || sys_num == SYS_THREAD_START ||
+                             sys_num == SYS_CLONE_DEBUG || sys_num == SYS_CLONE_CHILD_EXIT);
     // Also log network-related syscalls (socket=198, connect=203, bind=200, sendto=206, recvfrom=207)
     bool is_network_syscall = (sys_num == 198 || sys_num == 200 || sys_num == 203 || sys_num == 206 || sys_num == 207);
 
@@ -451,8 +476,10 @@ static libafl_syshook_ret pre_syscall_hook(
         uint64_t pc = qemu::read_reg(cpu, qemu::REG_PC);
         uint64_t lr = qemu::read_reg(cpu, qemu::REG_LR);
         uint64_t x0 = qemu::read_reg(cpu, qemu::REG_X0);
+        uint64_t tpidr = qemu::read_reg(cpu, qemu::REG_TPIDR_EL0);
         EMU_LOG << "[SYSCALL] SYS_CLONE_DEBUG: After clone! SP=0x" << std::hex << sp
-                  << " PC=0x" << pc << " LR=0x" << lr << " X0=0x" << x0 << std::dec << std::endl;
+                  << " PC=0x" << pc << " LR=0x" << lr << " X0=0x" << x0
+                  << " TPIDR_EL0=0x" << tpidr << std::dec << std::endl;
         ret.tag = LIBAFL_SYSHOOK_SKIP;
         ret.syshook_skip_retval = 0;
         return ret;
@@ -463,14 +490,27 @@ static libafl_syshook_ret pre_syscall_hook(
         CPUState* cpu = libafl_qemu_current_cpu();
         uint64_t sp = qemu::read_reg(cpu, qemu::REG_SP);
         uint64_t pc = qemu::read_reg(cpu, qemu::REG_PC);
-        // Read start_routine and arg from stack
-        uint64_t start_routine = 0, arg = 0;
+        uint64_t x4 = qemu::read_reg(cpu, qemu::REG_X4);
+        // Read start_routine, arg, and tls from stack
+        uint64_t start_routine = 0, arg = 0, tls_on_stack = 0;
         cpu_memory_rw_debug(cpu, sp, &start_routine, 8, 0);
         cpu_memory_rw_debug(cpu, sp + 8, &arg, 8, 0);
+        cpu_memory_rw_debug(cpu, sp + 16, &tls_on_stack, 8, 0);
+
+        // WORKAROUND: MSR TPIDR_EL0 doesn't work in QEMU usermode
+        // Set TPIDR_EL0 via QEMU API instead
+        if (tls_on_stack != 0) {
+            qemu::write_reg(cpu, qemu::REG_TPIDR_EL0, tls_on_stack);
+        }
+        uint64_t tpidr = qemu::read_reg(cpu, qemu::REG_TPIDR_EL0);
+
         EMU_LOG << "[SYSCALL] SYS_THREAD_START: Child thread starting! SP=0x"
                   << std::hex << sp << " PC=0x" << pc
                   << " start_routine=0x" << start_routine
-                  << " arg=0x" << arg << std::dec << std::endl;
+                  << " arg=0x" << arg
+                  << " tls_on_stack=0x" << tls_on_stack
+                  << " X4=0x" << x4
+                  << " TPIDR_EL0=0x" << tpidr << std::dec << std::endl;
         ret.tag = LIBAFL_SYSHOOK_SKIP;
         ret.syshook_skip_retval = 0;
         return ret;
@@ -495,11 +535,19 @@ static libafl_syshook_ret pre_syscall_hook(
         return ret;
     }
 
+    if (sys_num == SYS_CLONE_CHILD_EXIT) {
+        int exit_code = static_cast<int>(arg0);
+        EMU_LOG << "[SYSCALL] SYS_CLONE_CHILD_EXIT(" << exit_code << ")" << std::endl;
+        ::_exit(exit_code);
+    }
+
     // Handle HLE syscalls (0x2000-0x2FFF range)
     // These are generated by HLE stubs to trigger HLE function execution
     if (sys_num >= 0x2000 && sys_num < 0x3000) {
-        EMU_LOG << "[HLE_SYSCALL] Got HLE syscall 0x" << std::hex << sys_num
-                  << " PC=0x" << hook_pc << std::dec << std::endl;
+#if EMU_VERBOSE_LOGGING
+        EMU_LOG_VERBOSE << "[HLE_SYSCALL] Got HLE syscall 0x" << std::hex << sys_num
+                        << " PC=0x" << hook_pc << std::dec << std::endl;
+#endif
         auto it = g_hle_syscall_to_addr.find(sys_num);
         if (it != g_hle_syscall_to_addr.end()) {
             uint64_t hle_addr = it->second;
@@ -556,19 +604,29 @@ static libafl_syshook_ret pre_syscall_hook(
         }
     }
 
-    // Handle exit/exit_group ourselves to capture the exit code
-    // Without this, QEMU handles exit natively and we lose the exit status
+    // Handle exit/exit_group ourselves to capture the exit code.
+    //
+    // Guest worker threads sometimes terminate via SYS_exit without hitting the
+    // custom SYS_THREAD_DONE path first, especially when pthread_exit is routed
+    // through bionic's internal teardown. In that case we still need to mark the
+    // thread complete so pthread_join can observe it.
+    //
+    // Note: We don't call ::_exit() in forked children because QEMU's internal
+    // state isn't fully fork-safe and causes crashes. Death tests will timeout
+    // but the suite won't take down the host process.
     if (sys_num == 93 /* SYS_exit */ || sys_num == 94 /* SYS_exit_group */) {
         int exit_code = static_cast<int>(arg0);
-        EMU_LOG << "[SYSCALL] exit/exit_group(" << exit_code << ") - stopping emulation" << std::endl;
-
-        // Set X0 to the exit code so it can be read after emulation stops
-        CPUState* cpu = libafl_qemu_current_cpu();
-        if (cpu) {
-            qemu::write_reg(cpu, qemu::REG_X0, static_cast<uint64_t>(exit_code));
+        if (sys_num == 93 /* SYS_exit */) {
+            notify_thread_exit(hook_sp, static_cast<uint64_t>(arg0));
         }
 
-        // Stop emulation
+        EMU_LOG << "[SYSCALL] " << (sys_num == 93 ? "exit" : "exit_group")
+                << "(" << exit_code << ") - stopping emulation" << std::endl;
+
+        // Set X0 to the exit code so it can be read after emulation stops.
+        qemu::write_reg(hook_cpu, qemu::REG_X0, static_cast<uint64_t>(arg0));
+
+        // Stop the current thread's emulation loop.
         emu->stop();
 
         ret.tag = LIBAFL_SYSHOOK_SKIP;
@@ -740,6 +798,17 @@ void HleManager::register_defaults() {
     register_hle_syslog(*this);
     register_hle_user(*this);
     register_hle_crypto(*this);
+
+    // Split from hle_misc.cpp
+    register_hle_stdlib(*this);
+    register_hle_wchar(*this);
+    register_hle_locale(*this);
+    register_hle_ctype(*this);
+    register_hle_signal(*this);
+    register_hle_search(*this);
+    register_hle_sched(*this);
+    register_hle_setjmp(*this);
+    register_hle_sysconf(*this);
 }
 
 void HleManager::register_function(const std::string &name, HleCallback callback) {
@@ -1013,6 +1082,7 @@ void Emulator::initialize() {
     memory_->map(HLE_BASE, HLE_SIZE, MEM_READ | MEM_WRITE | MEM_EXEC, "HLE");
     memory_->map(STACK_BASE - config_.stack_size, config_.stack_size,
                  MEM_READ | MEM_WRITE, "Stack");
+    memory_->map(SAFE_CALL_STACK_BASE, SAFE_CALL_STACK_SIZE, MEM_READ | MEM_WRITE, "SafeCallStack");
     memory_->map(HEAP_BASE, config_.heap_size, MEM_READ | MEM_WRITE, "Heap");
     memory_->map(GLOBAL_DATA_BASE, GLOBAL_DATA_SIZE, MEM_READ | MEM_WRITE, "GlobalData");
     memory_->map(TLS_BASE - TLS_PRE_SIZE, TLS_SIZE + TLS_PRE_SIZE,
@@ -1057,6 +1127,25 @@ void Emulator::initialize() {
         EMU_LOG << "[EMU] WARNING: Failed to write RET after MSR" << std::endl;
     }
     tls_init_addr_ = tls_init_addr;
+
+    // Guest-side trampoline used for nested safe calls. The trampoline loads
+    // X0-X7 and the target address from guest memory so callback dispatch does
+    // not depend on host-side register writes while inside syscall hooks.
+    static const uint32_t safe_call_trampoline[] = {
+        0x910003E9,  // mov x9, sp
+        0xF9400130,  // ldr x16, [x9]
+        0xA9408520,  // ldp x0, x1, [x9, #0x8]
+        0xA9418D22,  // ldp x2, x3, [x9, #0x18]
+        0xA9429524,  // ldp x4, x5, [x9, #0x28]
+        0xA9439D26,  // ldp x6, x7, [x9, #0x38]
+        0x9101413F,  // add sp, x9, #0x50
+        0xD61F0200,  // br x16
+    };
+    if (!memory_->write(SAFE_CALL_TRAMPOLINE_ADDR, safe_call_trampoline,
+                        sizeof(safe_call_trampoline))) {
+        EMU_LOG << "[EMU] WARNING: Failed to write safe-call trampoline at 0x"
+                << std::hex << SAFE_CALL_TRAMPOLINE_ADDR << std::dec << std::endl;
+    }
 
     // Initialize global data (writes ctype table, etc. to host memory)
     initialize_global_data();
@@ -1156,9 +1245,10 @@ void Emulator::initialize_qemu_on_this_thread() {
     }
     qemu_init_cv_.notify_all();
 
-    // CRITICAL: Wrap QEMU's signal handlers AFTER QEMU has installed them
-    // This protects non-QEMU threads (like .NET runtime) from crashes
-    wrap_qemu_signal_handlers();
+    // NOTE: Signal handler wrapping is DISABLED.
+    // It interferes with QEMU's signal handling.
+    // The QEMU patches (pthread_key approach) handle .NET thread safety.
+    // wrap_qemu_signal_handlers();
 
     EMU_LOG << "[EMU] QEMU initialization complete on this thread" << std::endl;
 }
@@ -1207,6 +1297,83 @@ void Emulator::initialize_global_data() {
     }
 
     global_symbols_["__sF"] = sf_addr;
+
+    // Also register stdin, stdout, stderr as individual symbols
+    // Some code references these directly instead of using __sF
+    global_symbols_["stdin"] = sf_addr;                    // __sF[0]
+    global_symbols_["stdout"] = sf_addr + FILE_SIZE;       // __sF[1]
+    global_symbols_["stderr"] = sf_addr + 2 * FILE_SIZE;   // __sF[2]
+
+    // Initialize sys_signame and sys_siglist arrays
+    // These are arrays of pointers to signal name/description strings
+    // On bionic, there are 64 signals (32 standard + 32 realtime)
+    constexpr size_t NUM_SIGNALS = 65;  // 0-64, with 0 unused
+    constexpr size_t PTR_SIZE = 8;      // 64-bit pointers
+
+    // Allocate space for the arrays after __sF
+    uint64_t signame_array_addr = sf_addr + FILE_SIZE * NUM_FILES + 0x100;
+    uint64_t siglist_array_addr = signame_array_addr + NUM_SIGNALS * PTR_SIZE;
+    uint64_t sigstrings_addr = siglist_array_addr + NUM_SIGNALS * PTR_SIZE;
+
+    // Signal names and descriptions
+    static const char* signames[] = {
+        "", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL",
+        "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD",
+        "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ",
+        "VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS"
+    };
+
+    static const char* sigdescs[] = {
+        "Unknown signal 0", "Hangup", "Interrupt", "Quit", "Illegal instruction",
+        "Trace/breakpoint trap", "Aborted", "Bus error", "Floating point exception",
+        "Killed", "User defined signal 1", "Segmentation fault", "User defined signal 2",
+        "Broken pipe", "Alarm clock", "Terminated", "Stack fault", "Child exited",
+        "Continued", "Stopped (signal)", "Stopped", "Stopped (tty input)",
+        "Stopped (tty output)", "Urgent I/O condition", "CPU time limit exceeded",
+        "File size limit exceeded", "Virtual timer expired", "Profiling timer expired",
+        "Window changed", "I/O possible", "Power failure", "Bad system call"
+    };
+
+    uint64_t string_offset = 0;
+    for (size_t i = 0; i < NUM_SIGNALS; i++) {
+        const char* name = (i < 32) ? signames[i] : "";
+        const char* desc = (i < 32) ? sigdescs[i] : "Unknown signal";
+
+        if (i == 0) {
+            uint64_t null_ptr = 0;
+            mem_write(signame_array_addr + i * PTR_SIZE, &null_ptr, PTR_SIZE);
+            mem_write(siglist_array_addr + i * PTR_SIZE, &null_ptr, PTR_SIZE);
+            continue;
+        }
+
+        // Write name string
+        uint64_t name_addr = sigstrings_addr + string_offset;
+        mem_write(name_addr, name, strlen(name) + 1);
+        string_offset += strlen(name) + 1;
+
+        // Write description string
+        uint64_t desc_addr = sigstrings_addr + string_offset;
+        mem_write(desc_addr, desc, strlen(desc) + 1);
+        string_offset += strlen(desc) + 1;
+
+        // Write pointers to arrays
+        mem_write(signame_array_addr + i * PTR_SIZE, &name_addr, PTR_SIZE);
+        mem_write(siglist_array_addr + i * PTR_SIZE, &desc_addr, PTR_SIZE);
+    }
+
+    global_symbols_["sys_signame"] = signame_array_addr;
+    global_symbols_["sys_siglist"] = siglist_array_addr;
+
+    // Initialize in6addr_loopback and in6addr_any (struct in6_addr = 16 bytes)
+    // in6addr_loopback = ::1
+    // in6addr_any = ::
+    uint64_t in6addr_base = siglist_array_addr + NUM_SIGNALS * PTR_SIZE + 0x200;
+    uint8_t loopback_addr[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}; // ::1
+    uint8_t any_addr[16] = {0}; // ::
+    mem_write(in6addr_base, loopback_addr, 16);
+    mem_write(in6addr_base + 16, any_addr, 16);
+    global_symbols_["in6addr_loopback"] = in6addr_base;
+    global_symbols_["in6addr_any"] = in6addr_base + 16;
 }
 
 void Emulator::setup_hooks() {
@@ -1283,7 +1450,11 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
 
     // Set up stack pointer if not already set
     uint64_t sp = qemu::read_reg(cpu, qemu::REG_SP);
-    if (sp == 0 || sp < STACK_BASE - config_.stack_size || sp > STACK_BASE) {
+    bool in_main_stack = sp >= STACK_BASE - config_.stack_size && sp <= STACK_BASE;
+    bool in_safe_call_stack =
+        sp >= SAFE_CALL_STACK_BASE && sp <= SAFE_CALL_STACK_BASE + SAFE_CALL_STACK_SIZE;
+    bool in_mapped_stack = (sp != 0) && memory_ != nullptr && memory_->is_mapped(sp);
+    if (sp == 0 || (!in_main_stack && !in_safe_call_stack && !in_mapped_stack)) {
         // Initialize stack pointer to top of stack
         sp = STACK_BASE - 16;  // Leave room at top
         qemu::write_reg(cpu, qemu::REG_SP, sp);
@@ -1352,14 +1523,76 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
 
         uint64_t current_pc = qemu::read_reg(cur_cpu, qemu::REG_PC);
 
+        // CRITICAL: Check for PC=0 (null pointer execution) and debug it
+        if (current_pc == 0) {
+            uint64_t lr = qemu::read_reg(cur_cpu, qemu::REG_LR);
+            uint64_t sp = qemu::read_reg(cur_cpu, qemu::REG_SP);
+            uint64_t x0 = qemu::read_reg(cur_cpu, qemu::REG_X0);
+            uint64_t x29 = qemu::read_reg(cur_cpu, qemu::REG_FP);
+            uint64_t x30 = qemu::read_reg(cur_cpu, qemu::REG_LR);
+
+            EMU_LOG << "[EMU] CRASH: PC=0x0 (null pointer execution)!" << std::endl;
+            EMU_LOG << "[EMU]   LR=0x" << std::hex << lr << " (caller return address)" << std::endl;
+            EMU_LOG << "[EMU]   SP=0x" << sp << " FP=0x" << x29 << " X0=0x" << x0 << std::dec << std::endl;
+
+            // Dump a few stack frames to help debug
+            EMU_LOG << "[EMU] Stack trace (recent return addresses):" << std::endl;
+            uint64_t frame_ptr = x29;
+            for (int i = 0; i < 10 && frame_ptr != 0 && frame_ptr >= sp; i++) {
+                uint64_t saved_fp = 0, saved_lr = 0;
+                if (mem_read(frame_ptr, &saved_fp, 8) && mem_read(frame_ptr + 8, &saved_lr, 8)) {
+                    EMU_LOG << "[EMU]   Frame " << i << ": FP=0x" << std::hex << saved_fp
+                            << " LR=0x" << saved_lr << std::dec << std::endl;
+                    frame_ptr = saved_fp;
+                } else {
+                    break;
+                }
+            }
+            break;
+        }
+
         // Debug iterations - show more progress
         EMU_LOG_VERBOSE << "[EMU] Loop " << loop_count << ": result=" << result
                       << " PC=0x" << std::hex << current_pc
                       << " end=0x" << end_address << std::dec << std::endl;
         loop_count++;
         // Safety check for infinite loops
-        if (loop_count > 10000) {
-            EMU_LOG << "[EMU] WARNING: Loop count exceeded 10000, may be stuck" << std::endl;
+        if (loop_count > 10000 && (loop_count % 10000 == 0)) {
+            // Print detailed debug info every 10000 iterations
+            uint64_t lr = qemu::read_reg(cur_cpu, qemu::REG_LR);
+            uint64_t sp = qemu::read_reg(cur_cpu, qemu::REG_SP);
+            uint64_t x0 = qemu::read_reg(cur_cpu, qemu::REG_X0);
+
+            // Get exit reason for debugging
+            struct libafl_exit_reason* exit_reason = libafl_get_exit_reason();
+            const char* exit_kind_name = "UNKNOWN";
+            if (exit_reason) {
+                switch (exit_reason->kind) {
+                    case LIBAFL_EXIT_INTERNAL: exit_kind_name = "INTERNAL"; break;
+                    case LIBAFL_EXIT_BREAKPOINT: exit_kind_name = "BREAKPOINT"; break;
+                    case LIBAFL_EXIT_CUSTOM_INSN: exit_kind_name = "CUSTOM_INSN"; break;
+                    case LIBAFL_EXIT_CRASH: exit_kind_name = "CRASH"; break;
+                    case LIBAFL_EXIT_TIMEOUT: exit_kind_name = "TIMEOUT"; break;
+                }
+            }
+
+            // Read more registers for crash debugging
+            uint64_t x19 = qemu::read_reg(cur_cpu, qemu::REG_X19);
+            uint64_t x20 = qemu::read_reg(cur_cpu, qemu::REG_X20);
+            uint64_t x21 = qemu::read_reg(cur_cpu, qemu::REG_X21);
+            uint64_t x22 = qemu::read_reg(cur_cpu, qemu::REG_X22);
+            uint64_t x23 = qemu::read_reg(cur_cpu, qemu::REG_X23);
+
+            EMU_LOG << "[EMU] WARNING: Loop count " << loop_count << " PC=0x" << std::hex << current_pc
+                    << " LR=0x" << lr << " SP=0x" << sp << " X0=0x" << x0
+                    << " result=" << std::dec << result << " exit_kind=" << exit_kind_name << std::endl;
+
+            // Additional register dump on first report
+            if (loop_count == 20000) {
+                EMU_LOG << "[EMU] CRASH DEBUG: x19=0x" << std::hex << x19
+                        << " x20=0x" << x20 << " x21=0x" << x21
+                        << " x22=0x" << x22 << " x23=0x" << x23 << std::dec << std::endl;
+            }
         }
 
         // Check if we hit the end address
@@ -1382,6 +1615,19 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
             if (new_pc == current_pc) {
                 // Handler didn't change PC, return to LR as normal
                 uint64_t lr = qemu::read_reg(cur_cpu, qemu::REG_LR);
+
+                // CRITICAL: Check for null LR before returning - this would cause PC=0 crash
+                if (lr == 0) {
+                    EMU_LOG << "[EMU] ERROR: HLE at 0x" << std::hex << current_pc << " has LR=0!"
+                            << " SP=0x" << qemu::read_reg(cur_cpu, qemu::REG_SP)
+                            << " X0=0x" << qemu::read_reg(cur_cpu, qemu::REG_X0)
+                            << " X29=0x" << qemu::read_reg(cur_cpu, qemu::REG_FP)
+                            << std::dec << std::endl;
+                    // Try to get the function name from hle_
+                    EMU_LOG << "[EMU] This indicates a call from code that didn't set LR correctly" << std::endl;
+                    break;  // Don't return to address 0
+                }
+
                 qemu::write_reg(cur_cpu, qemu::REG_PC, lr);
                 if (debug_enabled_) {
                     EMU_LOG << "[EMU] HLE handled at 0x" << std::hex << current_pc
@@ -1409,6 +1655,41 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
 
         // Check if QEMU exited normally or due to periodic yield
         if (result != 0) {
+            struct libafl_exit_reason* exit_reason = libafl_get_exit_reason();
+            if (exit_reason && exit_reason->kind == LIBAFL_EXIT_CRASH) {
+                uint64_t lr = qemu::read_reg(cur_cpu, qemu::REG_LR);
+                uint64_t sp = qemu::read_reg(cur_cpu, qemu::REG_SP);
+                uint64_t x0 = qemu::read_reg(cur_cpu, qemu::REG_X0);
+                uint64_t x1 = qemu::read_reg(cur_cpu, qemu::REG_X1);
+                uint64_t x19 = qemu::read_reg(cur_cpu, qemu::REG_X19);
+                uint64_t x20 = qemu::read_reg(cur_cpu, qemu::REG_X20);
+                uint64_t x21 = qemu::read_reg(cur_cpu, qemu::REG_X21);
+                uint64_t x22 = qemu::read_reg(cur_cpu, qemu::REG_X22);
+                uint64_t x23 = qemu::read_reg(cur_cpu, qemu::REG_X23);
+                bool x1_mapped = x1 != 0 && memory_->is_mapped(x1, sizeof(uint32_t));
+                uint32_t x1_value = 0;
+                bool x1_read_ok = x1_mapped && memory_->read(x1, &x1_value, sizeof(x1_value));
+
+                EMU_LOG << "[EMU] Guest crash: PC=0x" << std::hex << current_pc
+                        << " LR=0x" << lr
+                        << " SP=0x" << sp
+                        << " X0=0x" << x0
+                        << " X1=0x" << x1
+                        << " X19=0x" << x19
+                        << " X20=0x" << x20
+                        << " X21=0x" << x21
+                        << " X22=0x" << x22
+                        << " X23=0x" << x23
+                        << std::dec
+                        << " mapped_x1=" << x1_mapped
+                        << " read_x1=" << x1_read_ok;
+                if (x1_read_ok) {
+                    EMU_LOG << " x1_value=" << x1_value;
+                }
+                EMU_LOG << std::endl;
+                break;
+            }
+
             // Check if this is a periodic yield (PC is valid execution address)
             // We continue execution unless we hit end address or HLE
             // Valid PC ranges: CODE_BASE (loaded binaries)
@@ -1652,7 +1933,8 @@ void Emulator::emulator_thread_func() {
             request->t_exec_start = request->t_dequeued;  // Same for now
 #endif
             uint64_t result = call_function_internal(request->address, request->args,
-                                                      request->is_safe_call);
+                                                      request->is_safe_call,
+                                                      request->safe_stack_top);
 #if EMU_LOGGING_ENABLED
             request->t_exec_end = std::chrono::steady_clock::now();
 #endif
@@ -1745,19 +2027,11 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
     auto t2 = request->t_queued;
 #endif
 
-    // Wait for completion with timeout to prevent deadlock
     {
         std::unique_lock<std::mutex> lock(request->mutex);
-        // Use wait_for with 30 second timeout to prevent permanent deadlock
-        bool completed = request->cv.wait_for(lock, std::chrono::seconds(30), [&request] {
+        request->cv.wait(lock, [&request] {
             return request->completed.load(std::memory_order_acquire);
         });
-        if (!completed) {
-            EMU_LOG << "[EMU] TIMEOUT: call_function request timed out after 30s! addr=0x"
-                    << std::hex << request->address << std::dec << std::endl;
-            // Return error code to prevent permanent hang
-            return (uint64_t)-1;
-        }
     }
 
 #if EMU_LOGGING_ENABLED
@@ -1849,11 +2123,25 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
 }
 
 uint64_t Emulator::call_function_safe(uint64_t address, const std::vector<uint64_t>& args) {
+    return call_function_safe_on_stack(address, 0, args);
+}
+
+uint64_t Emulator::call_function_safe_on_stack(uint64_t address, uint64_t stack_top,
+                                               const std::vector<uint64_t>& args) {
     // If we're on the thread currently running QEMU (either background or direct),
-    // call internal directly to avoid deadlock
+    // call internal directly to avoid deadlock.
+    //
+    // In MTTCG mode, child guest threads run on their own host threads and do not
+    // share `current_execution_thread_id_`. When an HLE handler on one of those
+    // threads needs to make a nested guest call (for example a signal handler
+    // delivery from `sigsuspend`), queueing back to the emulator thread can
+    // deadlock if that thread is blocked in another HLE call such as
+    // `pthread_join`. Detect an active QEMU CPU on the current thread and run the
+    // nested safe call in-place.
     if (std::this_thread::get_id() == current_execution_thread_id_ ||
-        std::this_thread::get_id() == emulator_thread_id_) {
-        return call_function_internal(address, args, true);
+        std::this_thread::get_id() == emulator_thread_id_ ||
+        libafl_qemu_current_cpu() != nullptr) {
+        return call_function_internal(address, args, true, stack_top);
     }
 
     auto request = std::make_shared<FunctionRequest>();
@@ -1861,6 +2149,7 @@ uint64_t Emulator::call_function_safe(uint64_t address, const std::vector<uint64
     request->args = args;
     request->completed.store(false, std::memory_order_relaxed);
     request->is_safe_call = true;
+    request->safe_stack_top = stack_top;
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -1871,15 +2160,9 @@ uint64_t Emulator::call_function_safe(uint64_t address, const std::vector<uint64
 
     {
         std::unique_lock<std::mutex> lock(request->mutex);
-        // Use wait_for with 30 second timeout to prevent permanent deadlock
-        bool completed = request->cv.wait_for(lock, std::chrono::seconds(30), [&request] {
+        request->cv.wait(lock, [&request] {
             return request->completed.load(std::memory_order_acquire);
         });
-        if (!completed) {
-            EMU_LOG << "[EMU] TIMEOUT: call_function_safe request timed out after 30s! addr=0x"
-                    << std::hex << request->address << std::dec << std::endl;
-            return (uint64_t)-1;
-        }
     }
 
     return request->result;
@@ -1905,7 +2188,7 @@ uint64_t Emulator::call_function_direct(uint64_t address, const std::vector<uint
 }
 
 uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<uint64_t>& args,
-                                           bool is_safe) {
+                                          bool is_safe, uint64_t safe_stack_top) {
     // CRITICAL: Full memory barrier before executing any function
     // This ensures all writes from previous operations (including those from
     // child threads running in QEMU) are visible to the emulated code.
@@ -1942,36 +2225,139 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
         return (uint64_t)-1;
     }
 
-    // Set up arguments in X0-X7
-    static const int kArgRegs[8] = {
-        qemu::REG_X0, qemu::REG_X1, qemu::REG_X2, qemu::REG_X3,
-        qemu::REG_X4, qemu::REG_X5, qemu::REG_X6, qemu::REG_X7
+    std::vector<uint64_t> arg_values(args.begin(), args.end());
+
+    if (is_safe) {
+        EMU_LOG << "[EMU] safe call args: count=" << arg_values.size();
+        if (!arg_values.empty()) {
+            EMU_LOG << " arg0_in=0x" << std::hex << arg_values[0] << std::dec;
+        }
+        if (arg_values.size() > 1) {
+            EMU_LOG << " arg1_in=0x" << std::hex << arg_values[1] << std::dec;
+        }
+        EMU_LOG << std::endl;
+    }
+
+    static thread_local int call_depth = 0;
+    int next_call_depth = call_depth + 1;
+
+    struct SafeCallFrame {
+        uint64_t target = 0;
+        uint64_t arg_regs[8]{};
     };
 
-    for (size_t i = 0; i < args.size() && i < 8; i++) {
-        qemu::write_reg(cpu, kArgRegs[i], args[i]);
-    }
+    struct SafeCallContext {
+        uint64_t x[31]{};
+        uint64_t sp = 0;
+        uint64_t pc = 0;
+        uint64_t nzcv = 0;
+        uint64_t tpidr_el0 = 0;
+        uint8_t v[32][qemu::MAX_REGISTER_BYTES]{};
+        uint32_t fpsr = 0;
+        uint32_t fpcr = 0;
+    };
 
-    // Handle stack arguments
-    if (args.size() > 8) {
-        uint64_t sp = qemu::read_reg(cpu, qemu::REG_SP);
-        for (size_t i = 8; i < args.size(); i++) {
-            uint64_t stack_addr = sp + (i - 8) * 8;
-            memory_->write(stack_addr, &args[i], 8);
-        }
-    }
-
-    // Save registers and state if this is a safe call (nested call from HLE handler)
-    // CRITICAL: We must save and restore SP because nested calls use the stack,
-    // and the outer function expects SP to be at the same position when it resumes.
-    uint64_t saved_lr = 0;
-    uint64_t saved_pc = 0;
-    uint64_t saved_sp = 0;
+    SafeCallContext saved_ctx{};
     bool saved_running = tl_running;  // Thread-local: save this thread's running state
     if (is_safe) {
-        saved_lr = qemu::read_reg(cpu, qemu::REG_LR);
-        saved_pc = qemu::read_reg(cpu, qemu::REG_PC);
-        saved_sp = qemu::read_reg(cpu, qemu::REG_SP);
+        for (int reg = qemu::REG_X0; reg <= qemu::REG_X30; ++reg) {
+            saved_ctx.x[reg] = qemu::read_reg(cpu, reg);
+        }
+        saved_ctx.sp = qemu::read_reg(cpu, qemu::REG_SP);
+        saved_ctx.pc = qemu::read_reg(cpu, qemu::REG_PC);
+        saved_ctx.nzcv = qemu::read_reg(cpu, qemu::REG_CPSR);
+        saved_ctx.tpidr_el0 = qemu::read_reg(cpu, qemu::REG_TPIDR_EL0);
+        for (int reg = qemu::REG_V0; reg <= qemu::REG_V31; ++reg) {
+            qemu::read_reg_bytes(cpu, reg, saved_ctx.v[reg - qemu::REG_V0],
+                                 qemu::MAX_REGISTER_BYTES);
+        }
+        saved_ctx.fpsr = static_cast<uint32_t>(qemu::read_reg(cpu, qemu::REG_FPSR));
+        saved_ctx.fpcr = static_cast<uint32_t>(qemu::read_reg(cpu, qemu::REG_FPCR));
+
+        size_t raw_stack_arg_bytes =
+            arg_values.size() > 8 ? (arg_values.size() - 8) * sizeof(uint64_t) : 0;
+        uint64_t stack_arg_bytes =
+            raw_stack_arg_bytes == 0 ? 0 : MemoryManager::align_up(raw_stack_arg_bytes, 16);
+        uint64_t target_sp = 0;
+        uint64_t frame_base = 0;
+        if (safe_stack_top != 0) {
+            target_sp = MemoryManager::align_down(safe_stack_top - stack_arg_bytes, 16);
+            frame_base = target_sp - SAFE_CALL_CONTEXT_SIZE;
+        } else {
+            uint64_t stack_offset = static_cast<uint64_t>(next_call_depth) * SAFE_CALL_STACK_CHUNK;
+            if (stack_offset >= SAFE_CALL_STACK_SIZE) {
+                EMU_LOG << "[EMU] ERROR: safe call stack exhausted at depth "
+                        << next_call_depth << std::endl;
+                return static_cast<uint64_t>(-1);
+            }
+
+            target_sp =
+                SAFE_CALL_STACK_BASE + SAFE_CALL_STACK_SIZE - stack_offset - 0x100 - stack_arg_bytes;
+            frame_base = target_sp - SAFE_CALL_CONTEXT_SIZE;
+            uint64_t chunk_base =
+                SAFE_CALL_STACK_BASE + SAFE_CALL_STACK_SIZE - stack_offset - SAFE_CALL_STACK_CHUNK;
+            if (frame_base < chunk_base + 0x100) {
+                EMU_LOG << "[EMU] ERROR: safe call frame exhausted stack chunk at depth "
+                        << next_call_depth << std::endl;
+                return static_cast<uint64_t>(-1);
+            }
+        }
+
+        SafeCallFrame frame{};
+        frame.target = address;
+        for (size_t i = 0; i < arg_values.size() && i < 8; ++i) {
+            uint64_t arg_value = arg_values[i];
+            frame.arg_regs[i] = arg_value;
+        }
+        EMU_LOG << "[EMU] safe call local frame: target=0x" << std::hex << frame.target
+                << " arg0=0x" << frame.arg_regs[0]
+                << " arg1=0x" << frame.arg_regs[1]
+                << std::dec << std::endl;
+        memory_->write(frame_base, &frame, sizeof(frame));
+
+        SafeCallFrame verify_frame{};
+        bool verify_ok = memory_->read(frame_base, &verify_frame, sizeof(verify_frame));
+        EMU_LOG << "[EMU] safe call frame: base=0x" << std::hex << frame_base
+                << " target_sp=0x" << target_sp
+                << " entry=0x" << SAFE_CALL_TRAMPOLINE_ADDR
+                << " verify=" << std::dec << verify_ok;
+        if (verify_ok) {
+            EMU_LOG << " target=0x" << std::hex << verify_frame.target
+                    << " arg0=0x" << verify_frame.arg_regs[0]
+                    << " arg1=0x" << verify_frame.arg_regs[1]
+                    << std::dec;
+        }
+        EMU_LOG << std::endl;
+
+        if (arg_values.size() > 8) {
+            for (size_t i = 8; i < arg_values.size(); ++i) {
+                uint64_t stack_addr = target_sp + (i - 8) * sizeof(uint64_t);
+                memory_->write(stack_addr, &arg_values[i], sizeof(uint64_t));
+            }
+        }
+
+        qemu::write_reg(cpu, qemu::REG_SP, frame_base);
+    }
+
+    if (!is_safe) {
+        // Set up arguments in X0-X7
+        static const int kArgRegs[8] = {
+            qemu::REG_X0, qemu::REG_X1, qemu::REG_X2, qemu::REG_X3,
+            qemu::REG_X4, qemu::REG_X5, qemu::REG_X6, qemu::REG_X7
+        };
+
+        for (size_t i = 0; i < arg_values.size() && i < 8; i++) {
+            qemu::write_reg(cpu, kArgRegs[i], arg_values[i]);
+        }
+
+        // Handle stack arguments
+        if (arg_values.size() > 8) {
+            uint64_t sp = qemu::read_reg(cpu, qemu::REG_SP);
+            for (size_t i = 8; i < arg_values.size(); i++) {
+                uint64_t stack_addr = sp + (i - 8) * 8;
+                memory_->write(stack_addr, &arg_values[i], 8);
+            }
+        }
     }
 
     // Use unique return address for each call level to support nested calls
@@ -1980,8 +2366,7 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
     // NOTE: We must avoid addresses that conflict with HLE trampolines:
     //   0x100ffff0-0x100ffffc are used for thread exit/resume trampolines
     // So we use 0x100fff00 - call_depth*4 to stay safely below those addresses.
-    static thread_local int call_depth = 0;
-    call_depth++;
+    call_depth = next_call_depth;
     uint64_t ret_addr = HLE_BASE + 0xFFF00 - (call_depth * 4);
     qemu::write_reg(cpu, qemu::REG_LR, ret_addr);
 
@@ -1992,8 +2377,9 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
     if (is_safe && call_depth >= 2) {
         uint64_t x19 = qemu::read_reg(cpu, 19);  // X19 is callee-saved
         uint64_t x29 = qemu::read_reg(cpu, 29);  // X29/FP is frame pointer
-        EMU_LOG_VERBOSE << "[EMU] BEFORE nested call: saved_sp=0x" << std::hex << saved_sp
-                  << " saved_lr=0x" << saved_lr << " saved_pc=0x" << saved_pc
+        EMU_LOG_VERBOSE << "[EMU] BEFORE nested call: saved_sp=0x" << std::hex << saved_ctx.sp
+                  << " saved_lr=0x" << saved_ctx.x[qemu::REG_LR]
+                  << " saved_pc=0x" << saved_ctx.pc
                   << " X19=0x" << x19 << " X29(FP)=0x" << x29 << std::dec << std::endl;
 
         // Check critical stack address for corruption
@@ -2003,12 +2389,15 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
         EMU_LOG_VERBOSE << "[EMU] BEFORE: [0x7ffffcb0]=0x" << std::hex << critical_val << std::dec << std::endl;
     }
 
-    // Set PC to function address
-    qemu::write_reg(cpu, qemu::REG_PC, address);
+    uint64_t entry_address = is_safe ? SAFE_CALL_TRAMPOLINE_ADDR : address;
+
+    // Set PC to function address (or trampoline for nested safe calls)
+    qemu::write_reg(cpu, qemu::REG_PC, entry_address);
 
     // Run emulation (TODO: implement proper execution loop)
-    bool success = start(address, ret_addr);
+    bool success = start(entry_address, ret_addr);
     call_depth--;
+    uint64_t call_result = qemu::read_reg(cpu, qemu::REG_X0);
 
     // Log key register values AFTER the call for debugging
     if (is_safe && call_depth >= 1) {
@@ -2029,9 +2418,19 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
 
     // Restore LR, PC, SP, and tl_running if safe call (so outer execution continues correctly)
     if (is_safe) {
-        qemu::write_reg(cpu, qemu::REG_LR, saved_lr);
-        qemu::write_reg(cpu, qemu::REG_PC, saved_pc);
-        qemu::write_reg(cpu, qemu::REG_SP, saved_sp);  // CRITICAL: Restore SP for outer function
+        for (int reg = qemu::REG_X0; reg <= qemu::REG_X30; ++reg) {
+            qemu::write_reg(cpu, reg, saved_ctx.x[reg]);
+        }
+        qemu::write_reg(cpu, qemu::REG_SP, saved_ctx.sp);
+        qemu::write_reg(cpu, qemu::REG_PC, saved_ctx.pc);
+        qemu::write_reg(cpu, qemu::REG_CPSR, saved_ctx.nzcv);
+        qemu::write_reg(cpu, qemu::REG_TPIDR_EL0, saved_ctx.tpidr_el0);
+        for (int reg = qemu::REG_V0; reg <= qemu::REG_V31; ++reg) {
+            qemu::write_reg_bytes(cpu, reg, saved_ctx.v[reg - qemu::REG_V0],
+                                  qemu::MAX_REGISTER_BYTES);
+        }
+        qemu::write_reg(cpu, qemu::REG_FPSR, saved_ctx.fpsr);
+        qemu::write_reg(cpu, qemu::REG_FPCR, saved_ctx.fpcr);
         tl_running = saved_running;  // Thread-local: restore this thread's running state
     }
 
@@ -2041,7 +2440,7 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
         return (uint64_t)-1;
     }
 
-    return qemu::read_reg(cpu, qemu::REG_X0);
+    return call_result;
 }
 
 // =============================================================================
@@ -2123,10 +2522,18 @@ bool Emulator::load_library(const std::string& name, const std::vector<uint8_t>&
 
         // Then check global symbols
         auto it = global_symbols_.find(sym_name);
-        if (it != global_symbols_.end()) return it->second;
+        if (it != global_symbols_.end()) {
+            EMU_LOG << "[RELOC] Resolved global symbol " << sym_name << " to 0x"
+                      << std::hex << it->second << std::dec << std::endl;
+            return it->second;
+        }
         if (base_name != sym_name) {
             it = global_symbols_.find(base_name);
-            if (it != global_symbols_.end()) return it->second;
+            if (it != global_symbols_.end()) {
+                EMU_LOG << "[RELOC] Resolved global symbol " << base_name << " (from " << sym_name << ") to 0x"
+                          << std::hex << it->second << std::dec << std::endl;
+                return it->second;
+            }
         }
 
         // Finally check exports from already-loaded libraries
@@ -2158,6 +2565,30 @@ bool Emulator::load_library(const std::string& name, const std::vector<uint8_t>&
     if (!relocator_->process_relocations(*loader_, module.base_address, resolver)) {
         EMU_LOG << "[EMU] Failed to process relocations: " << name << std::endl;
         return false;
+    }
+
+    // Extract init_array functions for static constructors
+    // These must be called before main() to register gtest tests, etc.
+    auto [init_array_addr, init_array_size] = loader_->get_init_array_info();
+    if (init_array_addr != 0 && init_array_size > 0) {
+        // init_array_addr is relative to the file, needs to be adjusted for base address
+        uint64_t min_vaddr = loader_->get_min_vaddr();
+        uint64_t runtime_init_addr = init_array_addr - min_vaddr + module.base_address;
+
+        size_t num_init_funcs = init_array_size / 8;  // Each entry is a 64-bit function pointer
+        EMU_LOG << "[EMU] Found " << num_init_funcs << " init functions in init_array at 0x"
+                << std::hex << runtime_init_addr << std::dec << std::endl;
+
+        for (size_t i = 0; i < num_init_funcs; i++) {
+            uint64_t func_ptr = 0;
+            if (memory_->read(runtime_init_addr + i * 8, &func_ptr, 8)) {
+                // Skip invalid function pointers
+                if (func_ptr != 0 && func_ptr != static_cast<uint64_t>(-1)) {
+                    EMU_LOG << "[EMU]   init[" << i << "] = 0x" << std::hex << func_ptr << std::dec << std::endl;
+                    pending_init_funcs_.push_back(func_ptr);
+                }
+            }
+        }
     }
 
     modules_.push_back(module);

@@ -1,6 +1,7 @@
 #include "debug_log.h"
 #include "syscall_handler.h"
 #include "cross_shim.h"
+#include "hle_brk_state.h"
 #include "memory_manager.h"
 #include "thread_manager.h"
 #include "emu_compat.h"
@@ -9,6 +10,7 @@
 #include <random>
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -267,19 +269,28 @@ int64_t SyscallHandler::sys_lseek(int fd, int64_t offset, int whence) {
 }
 
 int64_t SyscallHandler::sys_mmap(uint64_t addr, size_t len, int prot, int flags, int fd, int64_t off) {
-    uint64_t result = memory_.heap().allocate(len, PAGE_SIZE);
+    uint64_t result = memory_.allocate_guest_memory(len, PAGE_SIZE);
     if (result == 0) return -12;
     memory_.zero(result, len);
     return result;
 }
 
 int64_t SyscallHandler::sys_mprotect(uint64_t addr, size_t len, int prot) { return 0; }
-int64_t SyscallHandler::sys_munmap(uint64_t addr, size_t len) { memory_.heap().free(addr); return 0; }
+int64_t SyscallHandler::sys_munmap(uint64_t addr, size_t len) { memory_.free_guest_memory(addr); return 0; }
 
 int64_t SyscallHandler::sys_brk(uint64_t addr) {
-    if (addr == 0) return current_brk_;
-    if (addr > current_brk_) current_brk_ = addr;
-    return current_brk_;
+    guest_brk_initialize(memory_.heap().get_base());
+    GuestBrkState& state = guest_brk_state();
+
+    if (addr == 0) {
+        return state.current_brk;
+    }
+    if (addr > static_cast<uint64_t>(std::numeric_limits<intptr_t>::max())) {
+        return state.current_brk;
+    }
+
+    state.current_brk = addr;
+    return state.current_brk;
 }
 
 int64_t SyscallHandler::sys_fstat(int fd, uint64_t statbuf) {
@@ -340,7 +351,7 @@ int64_t SyscallHandler::sys_exit(int status) {
     // Store the exit status in X0 before stopping so it can be read by the caller
     set_reg(emu_, UC_ARM64_REG_X0, static_cast<uint64_t>(status));
     emu_.stop();
-    return status;  // Return the actual exit status
+    return status;
 }
 int64_t SyscallHandler::sys_futex(uint64_t uaddr, int op, uint32_t val,
                                    uint64_t timeout, uint64_t uaddr2, uint32_t val3) {

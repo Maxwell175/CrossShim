@@ -10,6 +10,8 @@
 
 namespace cross_shim {
 
+static constexpr uint64_t DYNAMIC_ALLOC_BASE = 0x200000000ULL;
+
 // Guest base is set via set_qemu_ready() after QEMU init
 
 // HeapAllocator implementation with sorted free list (std::map)
@@ -200,7 +202,8 @@ uint64_t HeapAllocator::get_allocation_size(uint64_t address) const {
 
 // MemoryManager implementation
 MemoryManager::MemoryManager(void* /* unused */)
-    : heap_(HEAP_BASE, HEAP_SIZE), qemu_ready_(false), guest_base_(0) {}
+    : heap_(HEAP_BASE, HEAP_SIZE), next_dynamic_alloc_(DYNAMIC_ALLOC_BASE),
+      qemu_ready_(false), guest_base_(0) {}
 
 MemoryManager::~MemoryManager() {
     // Clean up any host-allocated memory for non-shared regions
@@ -463,8 +466,113 @@ bool MemoryManager::write(uint64_t address, const void* buffer, uint64_t size) {
 }
 
 bool MemoryManager::zero(uint64_t address, uint64_t size) {
-    std::vector<uint8_t> zeros(size, 0);
-    return write(address, zeros.data(), size);
+    static constexpr size_t ZERO_CHUNK = 1 << 20;
+    std::vector<uint8_t> zeros(std::min<uint64_t>(size, ZERO_CHUNK), 0);
+    uint64_t offset = 0;
+    while (offset < size) {
+        uint64_t chunk = std::min<uint64_t>(size - offset, zeros.size());
+        if (!write(address + offset, zeros.data(), chunk)) {
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+uint64_t MemoryManager::allocate_guest_memory(uint64_t size, uint64_t alignment) {
+    if (size == 0) {
+        size = 1;
+    }
+
+    uint64_t ptr = heap_.allocate(size, alignment);
+    if (ptr != 0) {
+        return ptr;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    uint64_t aligned_size = align_up(size, PAGE_SIZE);
+    uint64_t dynamic_alignment = std::max<uint64_t>(alignment, PAGE_SIZE);
+    uint64_t address = align_up(next_dynamic_alloc_, dynamic_alignment);
+    if (!map(address, aligned_size, MEM_READ | MEM_WRITE, "HeapDynamic")) {
+        return 0;
+    }
+    dynamic_allocations_[address] = aligned_size;
+    next_dynamic_alloc_ = address + aligned_size;
+    return address;
+}
+
+void MemoryManager::free_guest_memory(uint64_t address) {
+    if (address == 0) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        auto it = dynamic_allocations_.find(address);
+        if (it != dynamic_allocations_.end()) {
+            uint64_t size = it->second;
+            dynamic_allocations_.erase(it);
+            unmap(address, size);
+            return;
+        }
+    }
+
+    heap_.free(address);
+}
+
+uint64_t MemoryManager::get_guest_allocation_size(uint64_t address) const {
+    uint64_t heap_size = heap_.get_allocation_size(address);
+    if (heap_size != 0) {
+        return heap_size;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto it = dynamic_allocations_.find(address);
+    if (it != dynamic_allocations_.end()) {
+        return it->second;
+    }
+    return 0;
+}
+
+uint64_t MemoryManager::realloc_guest_memory(uint64_t address, uint64_t new_size, bool copy_contents) {
+    if (address == 0) {
+        return allocate_guest_memory(new_size);
+    }
+    if (new_size == 0) {
+        free_guest_memory(address);
+        return 0;
+    }
+
+    uint64_t old_size = get_guest_allocation_size(address);
+    if (old_size == 0) {
+        return 0;
+    }
+    if (new_size <= old_size) {
+        return address;
+    }
+
+    uint64_t new_addr = allocate_guest_memory(new_size);
+    if (new_addr == 0) {
+        return 0;
+    }
+
+    if (copy_contents) {
+        static constexpr size_t COPY_CHUNK = 1 << 20;
+        std::vector<uint8_t> buffer(COPY_CHUNK);
+        uint64_t offset = 0;
+        while (offset < old_size) {
+            uint64_t chunk = std::min<uint64_t>(old_size - offset, buffer.size());
+            if (!read(address + offset, buffer.data(), chunk) ||
+                !write(new_addr + offset, buffer.data(), chunk)) {
+                free_guest_memory(new_addr);
+                return 0;
+            }
+            offset += chunk;
+        }
+    }
+
+    free_guest_memory(address);
+    return new_addr;
 }
 
 void* MemoryManager::get_host_ptr(uint64_t guest_address) const {
@@ -509,5 +617,4 @@ bool MemoryManager::map_into_engine(void* /* unused */) const {
 }
 
 } // namespace cross_shim
-
 

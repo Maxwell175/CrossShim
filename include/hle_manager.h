@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <sys/types.h>
 
 namespace cross_shim {
 
@@ -106,8 +107,35 @@ void register_hle_network(HleManager& hle);
 // Pthread functions (mutex, cond, rwlock, thread operations)
 void register_hle_pthread(HleManager& hle);
 
-// Miscellaneous functions (getenv, atoi, strtol, rand, exit, etc.)
+// Miscellaneous functions (remaining misc functions)
 void register_hle_misc(HleManager& hle);
+
+// Standard library functions (getenv, atoi, strtol, rand, qsort, etc.)
+void register_hle_stdlib(HleManager& hle);
+
+// Wide character functions (wcs*, wmem*, wctype)
+void register_hle_wchar(HleManager& hle);
+
+// Locale and multibyte functions (setlocale, mb*, newlocale, c16/c32)
+void register_hle_locale(HleManager& hle);
+
+// Character classification functions (is*, to*, wctype, wctrans)
+void register_hle_ctype(HleManager& hle);
+
+// Signal functions (sigset*, sigprocmask*, pthread_sigmask*, etc.)
+void register_hle_signal(HleManager& hle);
+
+// Search functions (lfind, lsearch, tfind, tsearch, hcreate, hsearch, etc.)
+void register_hle_search(HleManager& hle);
+
+// Scheduler and semaphore functions (sched_*, sem_*)
+void register_hle_sched(HleManager& hle);
+
+// Non-local jumps (setjmp, longjmp)
+void register_hle_setjmp(HleManager& hle);
+
+// System configuration and resources (uname, getrlimit, pathconf, etc.)
+void register_hle_sysconf(HleManager& hle);
 
 // Math functions (sin, cos, sqrt, pow, floor, ceil, etc.)
 void register_hle_math(HleManager& hle);
@@ -132,9 +160,16 @@ void register_hle_crypto(HleManager& hle);
 // ============================================================================
 
 // Set the emulated errno value (used by HLE functions that fail)
-void hle_set_errno(int value);
+// Writes directly to the errno location in guest memory
+void hle_set_errno(Emulator& emu, int value);
 
-// Get the emulated errno value
-int hle_get_errno();
+// Get the emulated errno value from guest memory
+int hle_get_errno(Emulator& emu);
+
+// Guest thread identity helpers. These return guest-visible tids rather than
+// raw host-thread ids, so the emulated main thread still reports tid==pid.
+uint64_t hle_get_current_pthread_id(Emulator& emu);
+pid_t hle_get_current_visible_tid(Emulator& emu);
+pid_t hle_lookup_pthread_tid(Emulator& emu, uint64_t pthread_id);
 
 } // namespace cross_shim

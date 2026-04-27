@@ -8,14 +8,29 @@
 #ifndef QEMU_API_H
 #define QEMU_API_H
 
-#include <cstdint>
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+
+#include <glib.h>
 
 // Forward declarations from QEMU
 struct CPUState;
 struct CPUArchState;
 
 extern "C" {
+
+typedef struct {
+    int gdb_reg;
+    const char* name;
+    const char* feature_name;
+} GDBRegDesc;
+
+GArray* gdb_get_register_list(CPUState* cpu);
 
 // =============================================================================
 // QEMU Initialization
@@ -406,6 +421,38 @@ void libafl_set_return_on_crash(bool return_on_crash);
  */
 bool libafl_get_return_on_crash(void);
 
+// =============================================================================
+// Exit Reason (for debugging why QEMU stopped)
+// =============================================================================
+
+/**
+ * Exit reason kinds - matches libafl/exit.h
+ */
+enum libafl_exit_reason_kind {
+    LIBAFL_EXIT_INTERNAL = 0,
+    LIBAFL_EXIT_BREAKPOINT = 1,
+    LIBAFL_EXIT_CUSTOM_INSN = 2,
+    LIBAFL_EXIT_CRASH = 3,
+    LIBAFL_EXIT_TIMEOUT = 4,
+};
+
+/**
+ * Exit reason structure - simplified version for our use
+ * The real structure in libafl/exit.h has more fields, but we only need kind
+ */
+struct libafl_exit_reason {
+    enum libafl_exit_reason_kind kind;
+    CPUState* cpu;
+    uint64_t next_pc;
+    // Union fields omitted - we only need kind for debugging
+};
+
+/**
+ * Get the last exit reason
+ * @return Pointer to exit reason structure
+ */
+struct libafl_exit_reason* libafl_get_exit_reason(void);
+
 } // extern "C"
 
 // =============================================================================
@@ -414,13 +461,15 @@ bool libafl_get_return_on_crash(void);
 
 namespace qemu {
 
+constexpr size_t MAX_REGISTER_BYTES = 256;
+
 // =============================================================================
 // ARM64 GDB Register Numbering
 // =============================================================================
-// QEMU's GDB interface uses a flat namespace with coprocessors appended:
-// - Core registers: 0-33 (X0-X30, SP, PC, CPSR)
-// - FPU coprocessor: 34-67 (V0-V31, FPSR, FPCR)
-// - TLS coprocessor: 68-69 (TPIDR_EL0, TPIDR2_EL0)
+// Core registers are stable at 0-33. Supplemental feature blocks are appended
+// dynamically by QEMU at runtime, so non-core register ids are not universally
+// stable across all CPU feature sets. We keep the common FPU numbering here and
+// resolve TLS registers dynamically from QEMU's live register list.
 
 enum Arm64Reg {
     // General purpose registers (X0-X30)
@@ -480,15 +529,227 @@ enum Arm64Reg {
     REG_LR = REG_X30,  // Link register
 };
 
+namespace detail {
+
+struct DynamicRegInfo {
+    int gdb_reg = -1;
+    size_t size = 0;
+};
+
+struct DynamicRegCache {
+    bool initialized = false;
+    DynamicRegInfo tpidr_el0{};
+    DynamicRegInfo tpidr2_el0{};
+    DynamicRegInfo fpsr{};
+    DynamicRegInfo fpcr{};
+    std::array<DynamicRegInfo, 32> vectors{};
+};
+
+inline DynamicRegCache& dynamic_reg_cache() {
+    static DynamicRegCache cache{};
+    return cache;
+}
+
+inline std::mutex& dynamic_reg_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline bool is_vector_reg(int reg) {
+    return reg >= REG_V0 && reg <= REG_V31;
+}
+
+inline size_t fallback_reg_size(int reg) {
+    if (is_vector_reg(reg)) {
+        return 16;
+    }
+    if (reg == REG_FPSR || reg == REG_FPCR) {
+        return 4;
+    }
+    return 8;
+}
+
+inline size_t probe_reg_size(CPUState* cpu, int gdb_reg, int fallback_reg) {
+    if (!cpu || gdb_reg < 0) {
+        return fallback_reg_size(fallback_reg);
+    }
+
+    std::array<uint8_t, MAX_REGISTER_BYTES> buf{};
+    int len = libafl_qemu_read_reg(cpu, gdb_reg, buf.data());
+    if (len <= 0) {
+        return fallback_reg_size(fallback_reg);
+    }
+    return std::min(buf.size(), static_cast<size_t>(len));
+}
+
+inline bool parse_vector_reg_name(const char* name, int* index_out) {
+    if (!name || !index_out) {
+        return false;
+    }
+
+    char prefix = '\0';
+    int index = -1;
+    char trailing = '\0';
+    int matched = std::sscanf(name, "%c%d%c", &prefix, &index, &trailing);
+    if (matched != 2) {
+        return false;
+    }
+    if (prefix != 'v' && prefix != 'z') {
+        return false;
+    }
+    if (index < 0 || index >= 32) {
+        return false;
+    }
+
+    *index_out = index;
+    return true;
+}
+
+inline void initialize_dynamic_reg_cache(CPUState* cpu) {
+    DynamicRegCache& cache = dynamic_reg_cache();
+    if (cache.initialized || !cpu) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(dynamic_reg_cache_mutex());
+    if (cache.initialized) {
+        return;
+    }
+
+    GArray* regs = gdb_get_register_list(cpu);
+    if (!regs) {
+        cache.initialized = true;
+        return;
+    }
+
+    for (guint i = 0; i < regs->len; ++i) {
+        GDBRegDesc desc = g_array_index(regs, GDBRegDesc, i);
+        if (desc.name == nullptr) {
+            continue;
+        }
+
+        int vector_index = -1;
+        if (parse_vector_reg_name(desc.name, &vector_index)) {
+            cache.vectors[vector_index].gdb_reg = desc.gdb_reg;
+            cache.vectors[vector_index].size =
+                probe_reg_size(cpu, desc.gdb_reg, REG_V0 + vector_index);
+            continue;
+        }
+
+        if (std::strcmp(desc.name, "fpsr") == 0) {
+            cache.fpsr.gdb_reg = desc.gdb_reg;
+            cache.fpsr.size = probe_reg_size(cpu, desc.gdb_reg, REG_FPSR);
+            continue;
+        }
+
+        if (std::strcmp(desc.name, "fpcr") == 0) {
+            cache.fpcr.gdb_reg = desc.gdb_reg;
+            cache.fpcr.size = probe_reg_size(cpu, desc.gdb_reg, REG_FPCR);
+            continue;
+        }
+
+        if (std::strcmp(desc.name, "tpidr") == 0) {
+            cache.tpidr_el0.gdb_reg = desc.gdb_reg;
+            cache.tpidr_el0.size = probe_reg_size(cpu, desc.gdb_reg, REG_TPIDR_EL0);
+            continue;
+        }
+
+        if (std::strcmp(desc.name, "tpidr2") == 0) {
+            cache.tpidr2_el0.gdb_reg = desc.gdb_reg;
+            cache.tpidr2_el0.size = probe_reg_size(cpu, desc.gdb_reg, REG_TPIDR2_EL0);
+            continue;
+        }
+    }
+
+    g_array_free(regs, TRUE);
+    cache.initialized = true;
+}
+
+inline const DynamicRegInfo* get_dynamic_reg_info(CPUState* cpu, int reg) {
+    initialize_dynamic_reg_cache(cpu);
+
+    DynamicRegCache& cache = dynamic_reg_cache();
+    if (reg == REG_TPIDR_EL0) {
+        return &cache.tpidr_el0;
+    }
+    if (reg == REG_TPIDR2_EL0) {
+        return &cache.tpidr2_el0;
+    }
+    if (reg == REG_FPSR) {
+        return &cache.fpsr;
+    }
+    if (reg == REG_FPCR) {
+        return &cache.fpcr;
+    }
+    if (is_vector_reg(reg)) {
+        return &cache.vectors[reg - REG_V0];
+    }
+    return nullptr;
+}
+
+inline int resolve_reg(CPUState* cpu, int reg) {
+    const DynamicRegInfo* info = get_dynamic_reg_info(cpu, reg);
+    if (info && info->gdb_reg >= 0) {
+        return info->gdb_reg;
+    }
+    return reg;
+}
+
+inline size_t reg_size(CPUState* cpu, int reg) {
+    const DynamicRegInfo* info = get_dynamic_reg_info(cpu, reg);
+    if (info && info->size > 0) {
+        return std::min(info->size, MAX_REGISTER_BYTES);
+    }
+    return fallback_reg_size(reg);
+}
+
+} // namespace detail
+
 // Helper functions for register access
+inline int read_reg_bytes(CPUState* cpu, int reg, void* dst, size_t dst_size) {
+    if (!cpu) {
+        if (dst && dst_size > 0) {
+            std::memset(dst, 0, dst_size);
+        }
+        return 0;
+    }
+
+    if (dst && dst_size > 0) {
+        std::memset(dst, 0, dst_size);
+    }
+
+    std::array<uint8_t, MAX_REGISTER_BYTES> buf{};
+    int resolved_reg = detail::resolve_reg(cpu, reg);
+    int len = libafl_qemu_read_reg(cpu, resolved_reg, buf.data());
+    if (len > 0 && dst && dst_size > 0) {
+        std::memcpy(dst, buf.data(), std::min(dst_size, static_cast<size_t>(len)));
+    }
+    return len;
+}
+
+inline int write_reg_bytes(CPUState* cpu, int reg, const void* src, size_t src_size) {
+    if (!cpu) {
+        return 0;
+    }
+
+    std::array<uint8_t, MAX_REGISTER_BYTES> buf{};
+    size_t copy_size = std::min({src_size, detail::reg_size(cpu, reg), buf.size()});
+    if (src && copy_size > 0) {
+        std::memcpy(buf.data(), src, copy_size);
+    }
+
+    int resolved_reg = detail::resolve_reg(cpu, reg);
+    return libafl_qemu_write_reg(cpu, resolved_reg, buf.data());
+}
+
 inline uint64_t read_reg(CPUState* cpu, int reg) {
     uint64_t val = 0;
-    libafl_qemu_read_reg(cpu, reg, reinterpret_cast<uint8_t*>(&val));
+    read_reg_bytes(cpu, reg, &val, sizeof(val));
     return val;
 }
 
 inline void write_reg(CPUState* cpu, int reg, uint64_t val) {
-    libafl_qemu_write_reg(cpu, reg, reinterpret_cast<uint8_t*>(&val));
+    write_reg_bytes(cpu, reg, &val, sizeof(val));
 }
 
 // Memory access helpers

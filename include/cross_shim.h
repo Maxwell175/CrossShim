@@ -124,6 +124,8 @@ public:
     uint64_t call_function(uint64_t address, const std::vector<uint64_t>& args = {});
     // Safe version that preserves LR (use from within HLE handlers that call emulated code)
     uint64_t call_function_safe(uint64_t address, const std::vector<uint64_t>& args = {});
+    uint64_t call_function_safe_on_stack(uint64_t address, uint64_t stack_top,
+                                         const std::vector<uint64_t>& args = {});
     // Direct call from current thread (must be same thread as QEMU init)
     uint64_t call_function_direct(uint64_t address, const std::vector<uint64_t>& args = {});
     // Check if the last call_function succeeded
@@ -250,6 +252,7 @@ private:
         uint64_t result;
         std::atomic<bool> completed{false};  // Use atomic for spin-wait
         bool is_safe_call;  // Whether this is a call_function_safe
+        uint64_t safe_stack_top = 0;
         std::mutex mutex;
         std::condition_variable cv;
 
@@ -270,7 +273,8 @@ private:
     std::condition_variable request_cv_;
 
     void emulator_thread_func();  // Background thread function
-    uint64_t call_function_internal(uint64_t address, const std::vector<uint64_t>& args, bool is_safe);
+    uint64_t call_function_internal(uint64_t address, const std::vector<uint64_t>& args, bool is_safe,
+                                    uint64_t safe_stack_top = 0);
     void start_emulator_thread();  // Start background thread
     void stop_emulator_thread();   // Stop background thread
 
@@ -292,4 +296,3 @@ public:
 CPUState* get_current_cpu(Emulator& emu);
 
 } // namespace cross_shim
-

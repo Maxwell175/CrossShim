@@ -37,56 +37,53 @@ inline void set_reg(Emulator& emu, int reg, uint64_t value) {
 }
 
 // Read a double-precision floating-point register (D0-D31 = lower 64 bits of V0-V31)
-// NOTE: QEMU's libafl_qemu_read_reg may read up to 256 bytes for FP registers
+// reg is a simple index 0-31, mapped to QEMU's V registers
 inline double get_dreg(Emulator& emu, int reg) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return 0.0;
-    // FP registers start at REG_V0 = 34
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[512] = {0};  // Large buffer to avoid stack overflow
-    libafl_qemu_read_reg(cpu, fp_reg, buf);
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
     double val;
-    memcpy(&val, buf, sizeof(val));
+    memcpy(&val, buf.data(), sizeof(val));
     return val;
 }
 
 // Write a double-precision floating-point register
-// NOTE: QEMU's libafl_qemu_read_reg/write_reg writes 256 bytes (all FP regs)
-// when accessing FPU coprocessor registers, so we use a larger buffer.
+// reg is a simple index 0-31, mapped to QEMU's V registers
 inline void set_dreg(Emulator& emu, int reg, double value) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return;
     int fp_reg = qemu::REG_V0 + reg;
-    // QEMU writes 256 bytes (32 FP regs × 8 bytes) for FPU register access
-    uint8_t buf[512] = {0};
-    libafl_qemu_read_reg(cpu, fp_reg, buf);
-    memcpy(buf, &value, sizeof(value));  // Modify lower 64 bits of V[reg]
-    libafl_qemu_write_reg(cpu, fp_reg, buf);
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
+    memcpy(buf.data(), &value, sizeof(value));  // Modify lower 64 bits of V[reg]
+    qemu::write_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
 }
 
 // Read a single-precision floating-point register (S0-S31 = lower 32 bits of V0-V31)
-// NOTE: QEMU's libafl_qemu_read_reg may read up to 256 bytes for FP registers
+// reg is a simple index 0-31, mapped to QEMU's V registers
 inline float get_sreg(Emulator& emu, int reg) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return 0.0f;
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[512] = {0};  // Large buffer to avoid stack overflow
-    libafl_qemu_read_reg(cpu, fp_reg, buf);
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
     float val;
-    memcpy(&val, buf, sizeof(val));
+    memcpy(&val, buf.data(), sizeof(val));
     return val;
 }
 
 // Write a single-precision floating-point register
-// NOTE: QEMU's libafl_qemu_read_reg/write_reg may read/write up to 256 bytes
+// reg is a simple index 0-31, mapped to QEMU's V registers
 inline void set_sreg(Emulator& emu, int reg, float value) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return;
     int fp_reg = qemu::REG_V0 + reg;
-    uint8_t buf[512] = {0};  // Large buffer to avoid stack overflow
-    libafl_qemu_read_reg(cpu, fp_reg, buf);  // Read full register
-    memcpy(buf, &value, sizeof(value));      // Modify lower 32 bits
-    libafl_qemu_write_reg(cpu, fp_reg, buf);
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, fp_reg, buf.data(), buf.size());  // Read full register
+    memcpy(buf.data(), &value, sizeof(value));                  // Modify lower 32 bits
+    qemu::write_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
 }
 
 // =============================================================================
@@ -130,27 +127,27 @@ constexpr int UC_ARM64_REG_LR = qemu::REG_LR;
 constexpr int UC_ARM64_REG_FP = qemu::REG_FP;
 constexpr int UC_ARM64_REG_NZCV = qemu::REG_CPSR;
 
-// SIMD/FP double register aliases (D0-D7 = lower 64 bits of V0-V7)
-// Note: These map to the FPU coprocessor registers starting at index 34
-constexpr int UC_ARM64_REG_D0 = qemu::REG_V0;
-constexpr int UC_ARM64_REG_D1 = qemu::REG_V1;
-constexpr int UC_ARM64_REG_D2 = qemu::REG_V2;
-constexpr int UC_ARM64_REG_D3 = qemu::REG_V3;
-constexpr int UC_ARM64_REG_D4 = qemu::REG_V4;
-constexpr int UC_ARM64_REG_D5 = qemu::REG_V5;
-constexpr int UC_ARM64_REG_D6 = qemu::REG_V6;
-constexpr int UC_ARM64_REG_D7 = qemu::REG_V7;
+// SIMD/FP double register indices for use with get_dreg/set_dreg
+// These are indices 0-7, the functions add REG_V0 base internally
+constexpr int UC_ARM64_REG_D0 = 0;
+constexpr int UC_ARM64_REG_D1 = 1;
+constexpr int UC_ARM64_REG_D2 = 2;
+constexpr int UC_ARM64_REG_D3 = 3;
+constexpr int UC_ARM64_REG_D4 = 4;
+constexpr int UC_ARM64_REG_D5 = 5;
+constexpr int UC_ARM64_REG_D6 = 6;
+constexpr int UC_ARM64_REG_D7 = 7;
 
-// SIMD/FP single register aliases (S0-S7 = lower 32 bits of V0-V7)
-// Note: These map to the same FPU registers - S and D share the V registers
-constexpr int UC_ARM64_REG_S0 = qemu::REG_V0;
-constexpr int UC_ARM64_REG_S1 = qemu::REG_V1;
-constexpr int UC_ARM64_REG_S2 = qemu::REG_V2;
-constexpr int UC_ARM64_REG_S3 = qemu::REG_V3;
-constexpr int UC_ARM64_REG_S4 = qemu::REG_V4;
-constexpr int UC_ARM64_REG_S5 = qemu::REG_V5;
-constexpr int UC_ARM64_REG_S6 = qemu::REG_V6;
-constexpr int UC_ARM64_REG_S7 = qemu::REG_V7;
+// SIMD/FP single register indices for use with get_sreg/set_sreg
+// These are indices 0-7, the functions add REG_V0 base internally
+constexpr int UC_ARM64_REG_S0 = 0;
+constexpr int UC_ARM64_REG_S1 = 1;
+constexpr int UC_ARM64_REG_S2 = 2;
+constexpr int UC_ARM64_REG_S3 = 3;
+constexpr int UC_ARM64_REG_S4 = 4;
+constexpr int UC_ARM64_REG_S5 = 5;
+constexpr int UC_ARM64_REG_S6 = 6;
+constexpr int UC_ARM64_REG_S7 = 7;
 
 // TLS register (TPIDR_EL0) - matches LibAFL QEMU register numbering
 constexpr int UC_ARM64_REG_TPIDR_EL0 = qemu::REG_TPIDR_EL0;
@@ -205,14 +202,14 @@ inline void get_qreg(Emulator& emu, int reg, uint8_t buf[16]) {
         memset(buf, 0, 16);
         return;
     }
-    libafl_qemu_read_reg(cpu, reg, buf);
+    qemu::read_reg_bytes(cpu, reg, buf, 16);
 }
 
 // Write a 128-bit Q register
 inline void set_qreg(Emulator& emu, int reg, const uint8_t buf[16]) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return;
-    libafl_qemu_write_reg(cpu, reg, const_cast<uint8_t*>(buf));
+    qemu::write_reg_bytes(cpu, reg, buf, 16);
 }
 
 // Read 128-bit Q register as __int128 (or two uint64_t)
@@ -222,15 +219,160 @@ inline void get_vreg(Emulator& emu, int reg, uint64_t val[2]) {
         val[0] = val[1] = 0;
         return;
     }
-    libafl_qemu_read_reg(cpu, reg, reinterpret_cast<uint8_t*>(val));
+    qemu::read_reg_bytes(cpu, reg, reinterpret_cast<uint8_t*>(val), sizeof(uint64_t) * 2);
 }
 
 // Write 128-bit Q register from two uint64_t
 inline void set_vreg(Emulator& emu, int reg, const uint64_t val[2]) {
     CPUState* cpu = get_current_cpu(emu);
     if (!cpu) return;
-    libafl_qemu_write_reg(cpu, reg, reinterpret_cast<uint8_t*>(const_cast<uint64_t*>(val)));
+    qemu::write_reg_bytes(cpu, reg, val, sizeof(uint64_t) * 2);
 }
+
+// =============================================================================
+// Long Double (128-bit IEEE 754 binary128) Register Access
+// =============================================================================
+
+// Read a long double from Q register (128-bit IEEE 754 binary128)
+// On ARM64, long double is passed in Q registers (full 128-bit V registers)
+// Note: x86-64 host doesn't natively support 128-bit long double, so we use
+// software conversion via the __float128 type if available, or approximate with double
+inline long double get_ldreg(Emulator& emu, int reg) {
+    CPUState* cpu = get_current_cpu(emu);
+    if (!cpu) return 0.0L;
+
+    int fp_reg = qemu::REG_V0 + reg;
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
+
+    // ARM64 uses IEEE 754 binary128 (quad precision) for long double
+    // On x86-64, we need to convert from binary128 to host long double
+    // Since glibc on x86-64 typically uses 80-bit extended precision for long double,
+    // we do a best-effort conversion using __float128 if available
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__aarch64__))
+    // Use __float128 which maps to IEEE 754 binary128
+    __float128 quad_val;
+    memcpy(&quad_val, buf.data(), 16);
+    return static_cast<long double>(quad_val);
+#else
+    // Fallback: just read as double from the lower 64 bits
+    // This loses precision but is better than nothing
+    double d;
+    memcpy(&d, buf.data(), sizeof(d));
+    return static_cast<long double>(d);
+#endif
+}
+
+// Write a long double to Q register (128-bit IEEE 754 binary128)
+inline void set_ldreg(Emulator& emu, int reg, long double value) {
+    CPUState* cpu = get_current_cpu(emu);
+    if (!cpu) return;
+
+    int fp_reg = qemu::REG_V0 + reg;
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+
+    // First read the existing register content
+    qemu::read_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__aarch64__))
+    // Convert to __float128 which maps to IEEE 754 binary128
+    __float128 quad_val = static_cast<__float128>(value);
+    memcpy(buf.data(), &quad_val, 16);
+#else
+    // Fallback: write as double to lower 64 bits
+    double d = static_cast<double>(value);
+    memcpy(buf.data(), &d, sizeof(d));
+#endif
+
+    qemu::write_reg_bytes(cpu, fp_reg, buf.data(), buf.size());
+}
+
+// Write a long double to guest memory in ARM64 binary128 format
+inline void write_ld_to_guest(Emulator& emu, uint64_t addr, long double value) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__aarch64__))
+    // Convert to __float128 which maps to IEEE 754 binary128
+    __float128 quad_val = static_cast<__float128>(value);
+    emu.mem_write(addr, &quad_val, 16);
+#else
+    // Fallback: write as double to lower 64 bits
+    uint8_t buf[16] = {0};
+    double d = static_cast<double>(value);
+    memcpy(buf, &d, sizeof(d));
+    emu.mem_write(addr, buf, 16);
+#endif
+}
+
+// =============================================================================
+// FPCR/FPSR Register Access for Floating-Point Environment
+// =============================================================================
+
+// Read FPCR (Floating-Point Control Register)
+// Bits 22-23: Rounding mode (RMode)
+//   00 = Round to Nearest (even)
+//   01 = Round toward Plus Infinity
+//   10 = Round toward Minus Infinity
+//   11 = Round toward Zero
+inline uint32_t get_fpcr(Emulator& emu) {
+    CPUState* cpu = get_current_cpu(emu);
+    if (!cpu) return 0;
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, qemu::REG_FPCR, buf.data(), buf.size());
+    uint32_t val;
+    memcpy(&val, buf.data(), sizeof(val));
+    return val;
+}
+
+// Write FPCR
+inline void set_fpcr(Emulator& emu, uint32_t value) {
+    CPUState* cpu = get_current_cpu(emu);
+    if (!cpu) return;
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    memcpy(buf.data(), &value, sizeof(value));
+    qemu::write_reg_bytes(cpu, qemu::REG_FPCR, buf.data(), buf.size());
+}
+
+// Read FPSR (Floating-Point Status Register)
+// Lower bits contain exception flags:
+//   Bit 0: IOC (Invalid Operation Cumulative)
+//   Bit 1: DZC (Division by Zero Cumulative)
+//   Bit 2: OFC (Overflow Cumulative)
+//   Bit 3: UFC (Underflow Cumulative)
+//   Bit 4: IXC (Inexact Cumulative)
+//   Bit 7: IDC (Input Denormal Cumulative)
+inline uint32_t get_fpsr(Emulator& emu) {
+    CPUState* cpu = get_current_cpu(emu);
+    if (!cpu) return 0;
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    qemu::read_reg_bytes(cpu, qemu::REG_FPSR, buf.data(), buf.size());
+    uint32_t val;
+    memcpy(&val, buf.data(), sizeof(val));
+    return val;
+}
+
+// Write FPSR
+inline void set_fpsr(Emulator& emu, uint32_t value) {
+    CPUState* cpu = get_current_cpu(emu);
+    if (!cpu) return;
+    std::array<uint8_t, qemu::MAX_REGISTER_BYTES> buf{};
+    memcpy(buf.data(), &value, sizeof(value));
+    qemu::write_reg_bytes(cpu, qemu::REG_FPSR, buf.data(), buf.size());
+}
+
+// ARM64 rounding mode constants (bits 22-23 of FPCR)
+constexpr uint32_t ARM64_FPCR_RMODE_SHIFT = 22;
+constexpr uint32_t ARM64_FPCR_RMODE_MASK = 0x3 << ARM64_FPCR_RMODE_SHIFT;
+constexpr uint32_t ARM64_RMODE_RN = 0;  // Round to Nearest (even)
+constexpr uint32_t ARM64_RMODE_RP = 1;  // Round toward Plus Infinity
+constexpr uint32_t ARM64_RMODE_RM = 2;  // Round toward Minus Infinity
+constexpr uint32_t ARM64_RMODE_RZ = 3;  // Round toward Zero
+
+// FPSR exception flag bits
+constexpr uint32_t ARM64_FPSR_IOC = 1 << 0;  // Invalid Operation
+constexpr uint32_t ARM64_FPSR_DZC = 1 << 1;  // Division by Zero
+constexpr uint32_t ARM64_FPSR_OFC = 1 << 2;  // Overflow
+constexpr uint32_t ARM64_FPSR_UFC = 1 << 3;  // Underflow
+constexpr uint32_t ARM64_FPSR_IXC = 1 << 4;  // Inexact
+constexpr uint32_t ARM64_FPSR_IDC = 1 << 7;  // Input Denormal
 
 } // namespace cross_shim
 

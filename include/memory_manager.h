@@ -107,6 +107,13 @@ public:
     // Zero memory
     bool zero(uint64_t address, uint64_t size);
 
+    // Guest allocation helpers. These fall back to dynamically mapped regions
+    // when the fixed heap is too small for the request.
+    uint64_t allocate_guest_memory(uint64_t size, uint64_t alignment = 16);
+    void free_guest_memory(uint64_t address);
+    uint64_t realloc_guest_memory(uint64_t address, uint64_t new_size, bool copy_contents = true);
+    uint64_t get_guest_allocation_size(uint64_t address) const;
+
     // Get heap allocator
     HeapAllocator& heap() { return heap_; }
 
@@ -132,6 +139,8 @@ public:
 private:
     std::vector<MemoryRegion> regions_;
     HeapAllocator heap_;
+    std::unordered_map<uint64_t, uint64_t> dynamic_allocations_;
+    uint64_t next_dynamic_alloc_;
     mutable std::recursive_mutex mutex_;
     bool qemu_ready_;
     uint64_t guest_base_;

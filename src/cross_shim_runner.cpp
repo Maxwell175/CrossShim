@@ -107,12 +107,13 @@ int main(int argc, char* argv[]) {
     uint64_t null_ptr = 0;
     emu.mem_write(argv_addr + emu_argc * 8, &null_ptr, 8);
 
-    // Set up registers for main(argc, argv)
-    emu.set_reg(0, emu_argc);   // x0 = argc
-    emu.set_reg(1, argv_addr);  // x1 = argv
-
-    // Call main
-    uint64_t result = emu.call_function_direct(main_addr);
+    // Call main with argc and argv as arguments
+    // IMPORTANT: Don't use set_reg() separately - pass args directly to call_function
+    // because the call may be queued to a different thread/CPU
+    uint64_t result = emu.call_function_direct(main_addr, {
+        static_cast<uint64_t>(emu_argc),
+        argv_addr
+    });
 
     return static_cast<int>(result);
 }

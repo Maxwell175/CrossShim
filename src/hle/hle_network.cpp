@@ -29,6 +29,10 @@
 #include <poll.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <ifaddrs.h>
+#include <linux/if_packet.h>
+#include <net/if.h>
 #include <cerrno>
 
 namespace cross_shim {
@@ -53,6 +57,232 @@ static std::string read_string(Emulator& emu, uint64_t addr, size_t max_len = 40
         result += c;
     }
     return result;
+}
+
+static size_t guest_sockaddr_size(int family) {
+    switch (family) {
+        case AF_INET:
+            return sizeof(sockaddr_in);
+        case AF_INET6:
+            return sizeof(sockaddr_in6);
+        case AF_PACKET:
+            return sizeof(sockaddr_ll);
+        default:
+            return sizeof(sockaddr);
+    }
+}
+
+static size_t guest_sockaddr_size(const sockaddr* addr) {
+    return (addr != nullptr) ? guest_sockaddr_size(addr->sa_family) : 0;
+}
+
+static bool query_interface_sockaddr(int ioctl_fd, const char* if_name,
+                                     unsigned long request, sockaddr_in& out) {
+    if (ioctl_fd < 0 || if_name == nullptr || *if_name == '\0') {
+        return false;
+    }
+
+    struct ifreq ifr {};
+    std::strncpy(ifr.ifr_name, if_name, IFNAMSIZ - 1);
+    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+    ifr.ifr_addr.sa_family = AF_INET;
+
+    if (::ioctl(ioctl_fd, request, &ifr) != 0 || ifr.ifr_addr.sa_family != AF_INET) {
+        return false;
+    }
+
+    std::memcpy(&out, &ifr.ifr_addr, sizeof(out));
+    return true;
+}
+
+static const sockaddr* select_guest_ifa_ifu(int ioctl_fd, const ifaddrs* ifa,
+                                            sockaddr_in& ioctl_addr_storage) {
+    if (ifa == nullptr) {
+        return nullptr;
+    }
+
+    if (ifa->ifa_addr != nullptr && ifa->ifa_addr->sa_family == AF_INET && ifa->ifa_name != nullptr) {
+        const unsigned long request = ((ifa->ifa_flags & IFF_BROADCAST) != 0) ? SIOCGIFBRDADDR : SIOCGIFDSTADDR;
+        if (query_interface_sockaddr(ioctl_fd, ifa->ifa_name, request, ioctl_addr_storage)) {
+            return reinterpret_cast<const sockaddr*>(&ioctl_addr_storage);
+        }
+    }
+
+    return ifa->ifa_broadaddr;
+}
+
+static size_t align_up_size(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static bool write_hostent_to_guest_buffer(Emulator& emu, const hostent* he,
+                                          uint64_t ret_ptr, uint64_t buf_ptr, size_t buflen) {
+    if (he == nullptr || ret_ptr == 0 || buf_ptr == 0) {
+        return false;
+    }
+
+    const char* h_name = (he->h_name != nullptr) ? he->h_name : "";
+    const size_t h_name_len = std::strlen(h_name) + 1;
+
+    size_t alias_count = 0;
+    while (he->h_aliases != nullptr && he->h_aliases[alias_count] != nullptr) {
+        ++alias_count;
+    }
+
+    size_t addr_count = 0;
+    while (he->h_addr_list != nullptr && he->h_addr_list[addr_count] != nullptr) {
+        ++addr_count;
+    }
+
+    size_t required = h_name_len;
+    required = align_up_size(required, 8);
+    required += (alias_count + 1) * sizeof(uint64_t);
+    for (size_t i = 0; i < alias_count; ++i) {
+        required += std::strlen(he->h_aliases[i]) + 1;
+    }
+    required = align_up_size(required, 8);
+    required += (addr_count + 1) * sizeof(uint64_t);
+    required = align_up_size(required, 8);
+    const size_t h_length = (he->h_length > 0) ? static_cast<size_t>(he->h_length) : 0;
+    required += addr_count * h_length;
+
+    if (required > buflen) {
+        return false;
+    }
+
+    size_t offset = 0;
+
+    uint64_t h_name_addr = buf_ptr + offset;
+    emu.mem_write(h_name_addr, h_name, h_name_len);
+    offset += h_name_len;
+
+    offset = align_up_size(offset, 8);
+    uint64_t h_aliases_addr = buf_ptr + offset;
+    offset += (alias_count + 1) * sizeof(uint64_t);
+
+    for (size_t i = 0; i < alias_count; ++i) {
+        uint64_t alias_addr = buf_ptr + offset;
+        size_t alias_len = std::strlen(he->h_aliases[i]) + 1;
+        emu.mem_write(alias_addr, he->h_aliases[i], alias_len);
+        emu.mem_write(h_aliases_addr + i * sizeof(uint64_t), &alias_addr, sizeof(alias_addr));
+        offset += alias_len;
+    }
+    uint64_t null_ptr = 0;
+    emu.mem_write(h_aliases_addr + alias_count * sizeof(uint64_t), &null_ptr, sizeof(null_ptr));
+
+    offset = align_up_size(offset, 8);
+    uint64_t h_addr_list_addr = buf_ptr + offset;
+    offset += (addr_count + 1) * sizeof(uint64_t);
+    offset = align_up_size(offset, 8);
+
+    for (size_t i = 0; i < addr_count; ++i) {
+        uint64_t addr_addr = buf_ptr + offset;
+        if (h_length != 0) {
+            emu.mem_write(addr_addr, he->h_addr_list[i], h_length);
+        }
+        emu.mem_write(h_addr_list_addr + i * sizeof(uint64_t), &addr_addr, sizeof(addr_addr));
+        offset += h_length;
+    }
+    emu.mem_write(h_addr_list_addr + addr_count * sizeof(uint64_t), &null_ptr, sizeof(null_ptr));
+
+    int32_t h_addrtype = he->h_addrtype;
+    int32_t guest_h_length = he->h_length;
+    emu.mem_write(ret_ptr + 0, &h_name_addr, sizeof(h_name_addr));
+    emu.mem_write(ret_ptr + 8, &h_aliases_addr, sizeof(h_aliases_addr));
+    emu.mem_write(ret_ptr + 16, &h_addrtype, sizeof(h_addrtype));
+    emu.mem_write(ret_ptr + 20, &guest_h_length, sizeof(guest_h_length));
+    emu.mem_write(ret_ptr + 24, &h_addr_list_addr, sizeof(h_addr_list_addr));
+
+    return true;
+}
+
+static bool write_localhost_hostent_to_guest_buffer(Emulator& emu,
+                                                    uint64_t ret_ptr, uint64_t buf_ptr,
+                                                    size_t buflen) {
+    static const char kLocalhostName[] = "localhost";
+    char* aliases[] = {nullptr};
+    uint8_t localhost_addr[] = {127, 0, 0, 1};
+    char* addr_list[] = {reinterpret_cast<char*>(localhost_addr), nullptr};
+
+    hostent localhost{};
+    localhost.h_name = const_cast<char*>(kLocalhostName);
+    localhost.h_aliases = aliases;
+    localhost.h_addrtype = AF_INET;
+    localhost.h_length = 4;
+    localhost.h_addr_list = addr_list;
+
+    return write_hostent_to_guest_buffer(emu, &localhost, ret_ptr, buf_ptr, buflen);
+}
+
+struct ServiceEntry {
+    const char* name;
+    uint16_t port;
+    const char* proto;
+};
+
+static const ServiceEntry kServiceEntries[] = {
+    {"echo", 7, "tcp"},
+    {"echo", 7, "udp"},
+    {"discard", 9, "tcp"},
+    {"discard", 9, "udp"},
+    {"daytime", 13, "tcp"},
+    {"daytime", 13, "udp"},
+    {"ftp-data", 20, "tcp"},
+    {"ftp", 21, "tcp"},
+    {"ssh", 22, "tcp"},
+    {"telnet", 23, "tcp"},
+    {"smtp", 25, "tcp"},
+    {"domain", 53, "tcp"},
+    {"domain", 53, "udp"},
+    {"tftp", 69, "udp"},
+    {"http", 80, "tcp"},
+    {"ntp", 123, "udp"},
+    {"https", 443, "tcp"},
+};
+
+static constexpr size_t kServiceEntryCount = sizeof(kServiceEntries) / sizeof(kServiceEntries[0]);
+static thread_local size_t g_service_enum_index = 0;
+
+static const ServiceEntry* find_service_by_name(const std::string& name, const char* proto) {
+    for (const auto& entry : kServiceEntries) {
+        if (name == entry.name && (proto == nullptr || std::strcmp(proto, entry.proto) == 0)) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static const ServiceEntry* find_service_by_port(int port_be, const char* proto) {
+    for (const auto& entry : kServiceEntries) {
+        if (port_be == htons(entry.port) && (proto == nullptr || std::strcmp(proto, entry.proto) == 0)) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static void write_service_entry(Emulator& emu, const ServiceEntry& entry, uint64_t base) {
+    size_t offset = 32;  // servent layout: s_name, s_aliases, s_port, padding, s_proto
+
+    uint64_t s_name_ptr = base + offset;
+    size_t name_len = std::strlen(entry.name) + 1;
+    emu.mem_write(s_name_ptr, entry.name, name_len);
+    offset += name_len;
+
+    uint64_t null = 0;
+    uint64_t s_aliases_ptr = base + offset;
+    emu.mem_write(s_aliases_ptr, &null, sizeof(null));
+    offset += sizeof(null);
+
+    uint64_t s_proto_ptr = base + offset;
+    size_t proto_len = std::strlen(entry.proto) + 1;
+    emu.mem_write(s_proto_ptr, entry.proto, proto_len);
+
+    int32_t s_port = htons(entry.port);
+    emu.mem_write(base + 0, &s_name_ptr, sizeof(s_name_ptr));
+    emu.mem_write(base + 8, &s_aliases_ptr, sizeof(s_aliases_ptr));
+    emu.mem_write(base + 16, &s_port, sizeof(s_port));
+    emu.mem_write(base + 24, &s_proto_ptr, sizeof(s_proto_ptr));
 }
 
 void register_hle_network(HleManager& hle) {
@@ -93,7 +323,7 @@ void register_hle_network(HleManager& hle) {
             EMU_LOG << "[HLE] connect result: " << result << " errno=" << errno << std::endl;
         }
         if (result < 0) {
-            hle_set_errno(errno);
+            hle_set_errno(emu, errno);
         }
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
@@ -187,7 +417,7 @@ void register_hle_network(HleManager& hle) {
             EMU_LOG << "[HLE] send result: " << result << std::endl;
         }
         if (result < 0) {
-            hle_set_errno(errno);
+            hle_set_errno(emu, errno);
         }
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
@@ -212,7 +442,7 @@ void register_hle_network(HleManager& hle) {
         if (result > 0) {
             emu.mem_write(buf_ptr, buf.data(), result);
         } else if (result < 0) {
-            hle_set_errno(errno);
+            hle_set_errno(emu, errno);
         }
 
         if (TRACE_NETWORK_IO && (call_num <= 10 || call_num % 100 == 0)) {
@@ -252,7 +482,7 @@ void register_hle_network(HleManager& hle) {
                                   (dest_addr && addrlen > 0) ? (struct sockaddr*)addr_buf.data() : nullptr, addrlen);
 
         if (result < 0) {
-            hle_set_errno(errno);
+            hle_set_errno(emu, errno);
         }
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
@@ -292,7 +522,7 @@ void register_hle_network(HleManager& hle) {
             if (addrlen_ptr) emu.mem_write(addrlen_ptr, &addrlen, sizeof(addrlen));
         } else if (result < 0) {
             // Set errno for the emulated code
-            hle_set_errno(errno);
+            hle_set_errno(emu, errno);
         }
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
@@ -541,6 +771,13 @@ void register_hle_network(HleManager& hle) {
             if (readfds_ptr) emu.mem_write(readfds_ptr, &readfds, sizeof(fd_set));
             if (writefds_ptr) emu.mem_write(writefds_ptr, &writefds, sizeof(fd_set));
             if (exceptfds_ptr) emu.mem_write(exceptfds_ptr, &exceptfds, sizeof(fd_set));
+            if (timeout_ptr && timeout_arg) {
+                timeval_arm64 timeout_arm{};
+                host_to_arm64_timeval(timeout, timeout_arm);
+                emu.mem_write(timeout_ptr, &timeout_arm, sizeof(timeout_arm));
+            }
+        } else {
+            hle_set_errno(emu, errno);
         }
 
         set_reg(emu, UC_ARM64_REG_X0, result);
@@ -1138,6 +1375,1000 @@ void register_hle_network(HleManager& hle) {
             }
         }
         set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // ========================================================================
+    // Legacy BSD network address functions
+    // ========================================================================
+
+    // inet_lnaof - extract the local network address part
+    hle.register_function("inet_lnaof", [](Emulator& emu) {
+        uint32_t in_addr_val = get_reg(emu, UC_ARM64_REG_X0);
+        struct in_addr in;
+        in.s_addr = in_addr_val;
+        in_addr_t result = inet_lnaof(in);
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // inet_netof - extract the network number
+    hle.register_function("inet_netof", [](Emulator& emu) {
+        uint32_t in_addr_val = get_reg(emu, UC_ARM64_REG_X0);
+        struct in_addr in;
+        in.s_addr = in_addr_val;
+        in_addr_t result = inet_netof(in);
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // inet_makeaddr - construct an internet address
+    hle.register_function("inet_makeaddr", [](Emulator& emu) {
+        in_addr_t net = get_reg(emu, UC_ARM64_REG_X0);
+        in_addr_t host = get_reg(emu, UC_ARM64_REG_X1);
+        struct in_addr result = inet_makeaddr(net, host);
+        set_reg(emu, UC_ARM64_REG_X0, result.s_addr);
+    });
+
+    // inet_network - interpret an IPv4 network number
+    hle.register_function("inet_network", [](Emulator& emu) {
+        uint64_t cp = get_reg(emu, UC_ARM64_REG_X0);
+        std::string addr = read_string(emu, cp);
+        in_addr_t result = inet_network(addr.c_str());
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // ========================================================================
+    // Interface address enumeration
+    // ========================================================================
+
+    // getifaddrs - get interface addresses
+    hle.register_function("getifaddrs", [](Emulator& emu) {
+        uint64_t ifap_ptr = get_reg(emu, UC_ARM64_REG_X0);
+
+        struct ifaddrs* ifap = nullptr;
+        int result = ::getifaddrs(&ifap);
+
+        if (result == 0 && ifap) {
+            constexpr size_t IFADDRS_SIZE = 56;
+            auto align_up = [](size_t value, size_t alignment) {
+                return (value + alignment - 1) & ~(alignment - 1);
+            };
+
+            struct guest_ifaddrs_layout {
+                const struct ifaddrs* host = nullptr;
+                sockaddr_in ioctl_ifu {};
+                bool ifu_from_ioctl = false;
+                size_t ifu_size = 0;
+                uint64_t struct_addr = 0;
+                uint64_t name_addr = 0;
+                uint64_t addr_addr = 0;
+                uint64_t netmask_addr = 0;
+                uint64_t ifu_addr = 0;
+            };
+
+            std::vector<guest_ifaddrs_layout> entries;
+            int ioctl_fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            size_t total_size = 0;
+
+            for (const struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+                guest_ifaddrs_layout entry{};
+                entry.host = ifa;
+
+                total_size = align_up(total_size, 8);
+                entry.struct_addr = total_size;
+                total_size += IFADDRS_SIZE;
+
+                if (ifa->ifa_name != nullptr) {
+                    entry.name_addr = total_size;
+                    total_size += std::strlen(ifa->ifa_name) + 1;
+                }
+
+                total_size = align_up(total_size, 8);
+                if (ifa->ifa_addr != nullptr) {
+                    entry.addr_addr = total_size;
+                    total_size += guest_sockaddr_size(ifa->ifa_addr);
+                }
+
+                total_size = align_up(total_size, 8);
+                if (ifa->ifa_netmask != nullptr) {
+                    entry.netmask_addr = total_size;
+                    total_size += guest_sockaddr_size(ifa->ifa_netmask);
+                }
+
+                total_size = align_up(total_size, 8);
+                const sockaddr* selected_ifu = select_guest_ifa_ifu(ioctl_fd, ifa, entry.ioctl_ifu);
+                entry.ifu_from_ioctl = (entry.ioctl_ifu.sin_family == AF_INET);
+                entry.ifu_size = guest_sockaddr_size(selected_ifu);
+                if (selected_ifu != nullptr) {
+                    entry.ifu_addr = total_size;
+                    total_size += entry.ifu_size;
+                }
+
+                entries.push_back(entry);
+            }
+
+            if (ioctl_fd >= 0) {
+                ::close(ioctl_fd);
+            }
+
+            uint64_t base = emu.memory().heap().allocate(std::max<size_t>(total_size, 8), 8);
+            std::vector<uint8_t> zeros(std::max<size_t>(total_size, 8), 0);
+            emu.mem_write(base, zeros.data(), zeros.size());
+
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const struct ifaddrs* ifa = entries[i].host;
+                uint64_t ifaddrs_addr = base + entries[i].struct_addr;
+                uint64_t next_ptr = (i + 1 < entries.size()) ? (base + entries[i + 1].struct_addr) : 0;
+                uint32_t flags = ifa->ifa_flags;
+                uint64_t data_ptr = 0;
+
+                if (entries[i].name_addr != 0) {
+                    emu.mem_write(base + entries[i].name_addr, ifa->ifa_name, std::strlen(ifa->ifa_name) + 1);
+                }
+                if (entries[i].addr_addr != 0) {
+                    emu.mem_write(base + entries[i].addr_addr, ifa->ifa_addr, guest_sockaddr_size(ifa->ifa_addr));
+                }
+                if (entries[i].netmask_addr != 0) {
+                    emu.mem_write(base + entries[i].netmask_addr, ifa->ifa_netmask, guest_sockaddr_size(ifa->ifa_netmask));
+                }
+                if (entries[i].ifu_addr != 0) {
+                    const sockaddr* ifu_addr = entries[i].ifu_from_ioctl
+                        ? reinterpret_cast<const sockaddr*>(&entries[i].ioctl_ifu)
+                        : ifa->ifa_broadaddr;
+                    if (ifu_addr != nullptr) {
+                        emu.mem_write(base + entries[i].ifu_addr, ifu_addr, entries[i].ifu_size);
+                    }
+                }
+
+                uint64_t name_addr = (entries[i].name_addr != 0) ? (base + entries[i].name_addr) : 0;
+                uint64_t addr_addr = (entries[i].addr_addr != 0) ? (base + entries[i].addr_addr) : 0;
+                uint64_t netmask_addr = (entries[i].netmask_addr != 0) ? (base + entries[i].netmask_addr) : 0;
+                uint64_t ifu_addr = (entries[i].ifu_addr != 0) ? (base + entries[i].ifu_addr) : 0;
+
+                emu.mem_write(ifaddrs_addr + 0, &next_ptr, 8);
+                emu.mem_write(ifaddrs_addr + 8, &name_addr, 8);
+                emu.mem_write(ifaddrs_addr + 16, &flags, 4);
+                emu.mem_write(ifaddrs_addr + 24, &addr_addr, 8);
+                emu.mem_write(ifaddrs_addr + 32, &netmask_addr, 8);
+                emu.mem_write(ifaddrs_addr + 40, &ifu_addr, 8);
+                emu.mem_write(ifaddrs_addr + 48, &data_ptr, 8);
+            }
+
+            uint64_t first_ptr = entries.empty() ? 0 : base + entries.front().struct_addr;
+            emu.mem_write(ifap_ptr, &first_ptr, sizeof(first_ptr));
+
+            ::freeifaddrs(ifap);
+        } else {
+            uint64_t null_ptr = 0;
+            emu.mem_write(ifap_ptr, &null_ptr, 8);
+            hle_set_errno(emu, errno);
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // freeifaddrs - free interface addresses
+    hle.register_function("freeifaddrs", [](Emulator& emu) {
+        uint64_t ifap = get_reg(emu, UC_ARM64_REG_X0);
+        // Walk the linked list and free the base allocation
+        // Note: we allocated everything in one block, so just free the first ptr
+        if (ifap) {
+            emu.memory().heap().free(ifap);
+        }
+    });
+
+    // ========================================================================
+    // ppoll - poll with timeout precision and signal mask
+    // ========================================================================
+
+    hle.register_function("ppoll", [](Emulator& emu) {
+        uint64_t fds_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        nfds_t nfds = get_reg(emu, UC_ARM64_REG_X1);
+        uint64_t tmo_p = get_reg(emu, UC_ARM64_REG_X2);
+        // uint64_t sigmask = get_reg(emu, UC_ARM64_REG_X3);  // ignored
+
+        if (nfds == 0 || fds_ptr == 0) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        // Read ARM64 bionic pollfd array and convert to host format
+        std::vector<pollfd_arm64> fds_arm(nfds);
+        std::vector<struct pollfd> fds(nfds);
+        emu.mem_read(fds_ptr, fds_arm.data(), nfds * sizeof(pollfd_arm64));
+        for (nfds_t i = 0; i < nfds; i++) {
+            arm64_to_host_pollfd(fds_arm[i], fds[i]);
+        }
+
+        // Convert timeout
+        struct timespec* tmo_ptr = nullptr;
+        struct timespec tmo;
+        if (tmo_p) {
+            timespec_arm64 tmo_arm;
+            emu.mem_read(tmo_p, &tmo_arm, sizeof(tmo_arm));
+            arm64_to_host_timespec(tmo_arm, tmo);
+            tmo_ptr = &tmo;
+        }
+
+        // Direct blocking ppoll - with MTTCG, this blocks only this host thread
+        int result = ::ppoll(fds.data(), nfds, tmo_ptr, nullptr);
+
+        // Convert back to ARM64 format and write back the results
+        if (result > 0) {
+            for (nfds_t i = 0; i < nfds; i++) {
+                host_to_arm64_pollfd(fds[i], fds_arm[i]);
+            }
+            emu.mem_write(fds_ptr, fds_arm.data(), nfds * sizeof(pollfd_arm64));
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // ppoll64 - same as ppoll but guaranteed 64-bit time_t
+    hle.register_function("ppoll64", [](Emulator& emu) {
+        uint64_t fds_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        nfds_t nfds = get_reg(emu, UC_ARM64_REG_X1);
+        uint64_t tmo_p = get_reg(emu, UC_ARM64_REG_X2);
+        // uint64_t sigmask = get_reg(emu, UC_ARM64_REG_X3);  // ignored
+
+        if (nfds == 0 || fds_ptr == 0) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        std::vector<pollfd_arm64> fds_arm(nfds);
+        std::vector<struct pollfd> fds(nfds);
+        emu.mem_read(fds_ptr, fds_arm.data(), nfds * sizeof(pollfd_arm64));
+        for (nfds_t i = 0; i < nfds; i++) {
+            arm64_to_host_pollfd(fds_arm[i], fds[i]);
+        }
+
+        struct timespec* tmo_ptr = nullptr;
+        struct timespec tmo;
+        if (tmo_p) {
+            timespec_arm64 tmo_arm;
+            emu.mem_read(tmo_p, &tmo_arm, sizeof(tmo_arm));
+            arm64_to_host_timespec(tmo_arm, tmo);
+            tmo_ptr = &tmo;
+        }
+
+        int result = ::ppoll(fds.data(), nfds, tmo_ptr, nullptr);
+
+        if (result > 0) {
+            for (nfds_t i = 0; i < nfds; i++) {
+                host_to_arm64_pollfd(fds[i], fds_arm[i]);
+            }
+            emu.mem_write(fds_ptr, fds_arm.data(), nfds * sizeof(pollfd_arm64));
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // ========================================================================
+    // FD_SET checked functions
+    // ========================================================================
+
+    // __FD_ISSET_chk - checked version of FD_ISSET
+    hle.register_function("__FD_ISSET_chk", [](Emulator& emu) {
+        int fd = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t fdset_ptr = get_reg(emu, UC_ARM64_REG_X1);
+        // size_t fdset_size = get_reg(emu, UC_ARM64_REG_X2);  // ignored
+
+        int result = 0;
+        if (fd >= 0 && fd < FD_SETSIZE && fdset_ptr) {
+            fd_set fds;
+            emu.mem_read(fdset_ptr, &fds, sizeof(fd_set));
+            result = FD_ISSET(fd, &fds) ? 1 : 0;
+        }
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // __FD_CLR_chk - checked version of FD_CLR
+    hle.register_function("__FD_CLR_chk", [](Emulator& emu) {
+        int fd = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t fdset_ptr = get_reg(emu, UC_ARM64_REG_X1);
+        // size_t fdset_size = get_reg(emu, UC_ARM64_REG_X2);  // ignored
+
+        if (fd >= 0 && fd < FD_SETSIZE && fdset_ptr) {
+            fd_set fds;
+            emu.mem_read(fdset_ptr, &fds, sizeof(fd_set));
+            FD_CLR(fd, &fds);
+            emu.mem_write(fdset_ptr, &fds, sizeof(fd_set));
+        }
+    });
+
+    // pselect - select with timeout precision and signal mask
+    hle.register_function("pselect", [](Emulator& emu) {
+        int nfds = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t readfds_ptr = get_reg(emu, UC_ARM64_REG_X1);
+        uint64_t writefds_ptr = get_reg(emu, UC_ARM64_REG_X2);
+        uint64_t exceptfds_ptr = get_reg(emu, UC_ARM64_REG_X3);
+        uint64_t timeout_ptr = get_reg(emu, UC_ARM64_REG_X4);
+        // uint64_t sigmask = get_reg(emu, UC_ARM64_REG_X5);  // ignored
+
+        fd_set readfds, writefds, exceptfds;
+        struct timespec timeout;
+
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        FD_ZERO(&exceptfds);
+
+        if (readfds_ptr) emu.mem_read(readfds_ptr, &readfds, sizeof(fd_set));
+        if (writefds_ptr) emu.mem_read(writefds_ptr, &writefds, sizeof(fd_set));
+        if (exceptfds_ptr) emu.mem_read(exceptfds_ptr, &exceptfds, sizeof(fd_set));
+
+        struct timespec* timeout_arg = nullptr;
+        if (timeout_ptr) {
+            timespec_arm64 timeout_arm;
+            emu.mem_read(timeout_ptr, &timeout_arm, sizeof(timeout_arm));
+            arm64_to_host_timespec(timeout_arm, timeout);
+            timeout_arg = &timeout;
+        }
+
+        int result = ::pselect(nfds,
+                               readfds_ptr ? &readfds : nullptr,
+                               writefds_ptr ? &writefds : nullptr,
+                               exceptfds_ptr ? &exceptfds : nullptr,
+                               timeout_arg, nullptr);
+
+        if (result >= 0) {
+            if (readfds_ptr) emu.mem_write(readfds_ptr, &readfds, sizeof(fd_set));
+            if (writefds_ptr) emu.mem_write(writefds_ptr, &writefds, sizeof(fd_set));
+            if (exceptfds_ptr) emu.mem_write(exceptfds_ptr, &exceptfds, sizeof(fd_set));
+        } else {
+            hle_set_errno(emu, errno);
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // socketpair - create a pair of connected sockets
+    hle.register_function("socketpair", [](Emulator& emu) {
+        int domain = get_reg(emu, UC_ARM64_REG_X0);
+        int type = get_reg(emu, UC_ARM64_REG_X1);
+        int protocol = get_reg(emu, UC_ARM64_REG_X2);
+        uint64_t sv_ptr = get_reg(emu, UC_ARM64_REG_X3);
+
+        int sv[2];
+        int result = ::socketpair(domain, type, protocol, sv);
+
+        if (result == 0 && sv_ptr) {
+            int32_t sv32[2] = { sv[0], sv[1] };
+            emu.mem_write(sv_ptr, sv32, sizeof(sv32));
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
+    // ========================================================================
+    // Extended gethostby* functions
+    // ========================================================================
+
+    // gethostbyname2 - get host entry by name with address family
+    hle.register_function("gethostbyname2", [](Emulator& emu) {
+        uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        int af = get_reg(emu, UC_ARM64_REG_X1);
+
+        if (!name_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        std::string name = read_string(emu, name_ptr);
+        struct hostent* he = gethostbyname2(name.c_str(), af);
+
+        if (!he) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        // Same allocation strategy as gethostbyname
+        static thread_local uint64_t hostent_buf = 0;
+        if (!hostent_buf) {
+            hostent_buf = emu.memory().heap().allocate(1024, 8);
+        }
+        uint64_t base = hostent_buf;
+        size_t offset = 32;  // After ARM64 hostent struct
+
+        // Copy h_name
+        uint64_t h_name_ptr = base + offset;
+        size_t name_len = strlen(he->h_name) + 1;
+        emu.mem_write(h_name_ptr, he->h_name, name_len);
+        offset += name_len;
+
+        // Count aliases and addresses
+        int num_aliases = 0;
+        while (he->h_aliases && he->h_aliases[num_aliases]) num_aliases++;
+        int num_addrs = 0;
+        while (he->h_addr_list && he->h_addr_list[num_addrs]) num_addrs++;
+
+        // Build h_aliases array
+        uint64_t h_aliases_ptr = base + offset;
+        offset += (num_aliases + 1) * 8;
+        for (int i = 0; i < num_aliases; i++) {
+            uint64_t alias_ptr = base + offset;
+            size_t alen = strlen(he->h_aliases[i]) + 1;
+            emu.mem_write(alias_ptr, he->h_aliases[i], alen);
+            emu.mem_write(h_aliases_ptr + i * 8, &alias_ptr, 8);
+            offset += alen;
+        }
+        uint64_t null_ptr = 0;
+        emu.mem_write(h_aliases_ptr + num_aliases * 8, &null_ptr, 8);
+
+        // Build h_addr_list array
+        uint64_t h_addr_list_ptr = base + offset;
+        offset += (num_addrs + 1) * 8;
+        for (int i = 0; i < num_addrs; i++) {
+            uint64_t addr_ptr = base + offset;
+            emu.mem_write(addr_ptr, he->h_addr_list[i], he->h_length);
+            emu.mem_write(h_addr_list_ptr + i * 8, &addr_ptr, 8);
+            offset += he->h_length;
+        }
+        emu.mem_write(h_addr_list_ptr + num_addrs * 8, &null_ptr, 8);
+
+        // Write hostent struct
+        emu.mem_write(base + 0, &h_name_ptr, 8);
+        emu.mem_write(base + 8, &h_aliases_ptr, 8);
+        int32_t h_addrtype = he->h_addrtype;
+        int32_t h_length = he->h_length;
+        emu.mem_write(base + 16, &h_addrtype, 4);
+        emu.mem_write(base + 20, &h_length, 4);
+        emu.mem_write(base + 24, &h_addr_list_ptr, 8);
+
+        set_reg(emu, UC_ARM64_REG_X0, base);
+    });
+
+    // gethostbyname_r - reentrant version
+    hle.register_function("gethostbyname_r", [](Emulator& emu) {
+        uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t ret_ptr = get_reg(emu, UC_ARM64_REG_X1);
+        uint64_t buf_ptr = get_reg(emu, UC_ARM64_REG_X2);
+        size_t buflen = get_reg(emu, UC_ARM64_REG_X3);
+        uint64_t result_ptr = get_reg(emu, UC_ARM64_REG_X4);
+        uint64_t h_errno_ptr = get_reg(emu, UC_ARM64_REG_X5);
+
+        if (!name_ptr || !ret_ptr || !buf_ptr || !result_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, -1);
+            return;
+        }
+
+        std::string name = read_string(emu, name_ptr);
+        struct hostent ret_he, *result_he;
+        std::vector<char> buf(buflen);
+        int h_errno_val = 0;
+        int rc = gethostbyname_r(name.c_str(), &ret_he, buf.empty() ? nullptr : buf.data(), buflen, &result_he, &h_errno_val);
+
+        if (h_errno_ptr) {
+            int32_t h_err32 = h_errno_val;
+            emu.mem_write(h_errno_ptr, &h_err32, 4);
+        }
+
+        if (rc == 0 && result_he) {
+            if (!write_hostent_to_guest_buffer(emu, result_he, ret_ptr, buf_ptr, buflen)) {
+                rc = ERANGE;
+                if (h_errno_ptr) {
+                    int32_t h_err32 = NETDB_INTERNAL;
+                    emu.mem_write(h_errno_ptr, &h_err32, 4);
+                }
+                uint64_t null = 0;
+                emu.mem_write(result_ptr, &null, 8);
+                set_reg(emu, UC_ARM64_REG_X0, rc);
+                return;
+            }
+            emu.mem_write(result_ptr, &ret_ptr, 8);
+        } else {
+            uint64_t null = 0;
+            emu.mem_write(result_ptr, &null, 8);
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, rc);
+    });
+
+    // gethostbyname2_r - reentrant version with address family
+    hle.register_function("gethostbyname2_r", [](Emulator& emu) {
+        uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        int af = get_reg(emu, UC_ARM64_REG_X1);
+        uint64_t ret_ptr = get_reg(emu, UC_ARM64_REG_X2);
+        uint64_t buf_ptr = get_reg(emu, UC_ARM64_REG_X3);
+        size_t buflen = get_reg(emu, UC_ARM64_REG_X4);
+        uint64_t result_ptr = get_reg(emu, UC_ARM64_REG_X5);
+        uint64_t h_errno_ptr = get_reg(emu, UC_ARM64_REG_X6);
+
+        if (!name_ptr || !ret_ptr || !buf_ptr || !result_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, -1);
+            return;
+        }
+
+        std::string name = read_string(emu, name_ptr);
+        struct hostent* result_he = gethostbyname2(name.c_str(), af);
+        int h_errno_val = result_he ? 0 : h_errno;
+        int rc = 0;
+
+        if (h_errno_ptr) {
+            int32_t h_err32 = h_errno_val;
+            emu.mem_write(h_errno_ptr, &h_err32, 4);
+        }
+
+        if (rc == 0 && result_he) {
+            if (!write_hostent_to_guest_buffer(emu, result_he, ret_ptr, buf_ptr, buflen)) {
+                rc = ERANGE;
+                h_errno_val = NETDB_INTERNAL;
+                if (h_errno_ptr) {
+                    int32_t h_err32 = h_errno_val;
+                    emu.mem_write(h_errno_ptr, &h_err32, 4);
+                }
+                uint64_t null = 0;
+                emu.mem_write(result_ptr, &null, 8);
+                set_reg(emu, UC_ARM64_REG_X0, rc);
+                return;
+            }
+            emu.mem_write(result_ptr, &ret_ptr, 8);
+        } else {
+            uint64_t null = 0;
+            emu.mem_write(result_ptr, &null, 8);
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, rc);
+    });
+
+    // gethostbyaddr_r - reentrant gethostbyaddr
+    hle.register_function("gethostbyaddr_r", [](Emulator& emu) {
+        uint64_t addr_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        socklen_t len = get_reg(emu, UC_ARM64_REG_X1);
+        int type = get_reg(emu, UC_ARM64_REG_X2);
+        uint64_t ret_ptr = get_reg(emu, UC_ARM64_REG_X3);
+        uint64_t buf_ptr = get_reg(emu, UC_ARM64_REG_X4);
+        size_t buflen = get_reg(emu, UC_ARM64_REG_X5);
+        uint64_t result_ptr = get_reg(emu, UC_ARM64_REG_X6);
+        uint64_t h_errno_ptr = get_reg(emu, UC_ARM64_REG_X7);
+
+        if (!addr_ptr || !ret_ptr || !buf_ptr || !result_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, -1);
+            return;
+        }
+
+        std::vector<char> addr(len);
+        emu.mem_read(addr_ptr, addr.data(), len);
+
+        if (type == AF_INET && len >= 4 &&
+            static_cast<uint8_t>(addr[0]) == 127 &&
+            static_cast<uint8_t>(addr[1]) == 0 &&
+            static_cast<uint8_t>(addr[2]) == 0 &&
+            static_cast<uint8_t>(addr[3]) == 1) {
+            if (!write_localhost_hostent_to_guest_buffer(emu, ret_ptr, buf_ptr, buflen)) {
+                if (h_errno_ptr) {
+                    int32_t h_err32 = NETDB_INTERNAL;
+                    emu.mem_write(h_errno_ptr, &h_err32, 4);
+                }
+                uint64_t null = 0;
+                emu.mem_write(result_ptr, &null, 8);
+                set_reg(emu, UC_ARM64_REG_X0, ERANGE);
+                return;
+            }
+
+            if (h_errno_ptr) {
+                int32_t h_err32 = 0;
+                emu.mem_write(h_errno_ptr, &h_err32, 4);
+            }
+            emu.mem_write(result_ptr, &ret_ptr, 8);
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        struct hostent ret_he, *result_he;
+        std::vector<char> buf(buflen);
+        int h_errno_val = 0;
+
+        int rc = gethostbyaddr_r(addr.data(), len, type, &ret_he, buf.empty() ? nullptr : buf.data(),
+                                 buflen, &result_he, &h_errno_val);
+
+        if (h_errno_ptr) {
+            int32_t h_err32 = h_errno_val;
+            emu.mem_write(h_errno_ptr, &h_err32, 4);
+        }
+
+        if (rc == 0 && result_he) {
+            if (!write_hostent_to_guest_buffer(emu, result_he, ret_ptr, buf_ptr, buflen)) {
+                rc = ERANGE;
+                if (h_errno_ptr) {
+                    int32_t h_err32 = NETDB_INTERNAL;
+                    emu.mem_write(h_errno_ptr, &h_err32, 4);
+                }
+                uint64_t null = 0;
+                emu.mem_write(result_ptr, &null, 8);
+                set_reg(emu, UC_ARM64_REG_X0, rc);
+                return;
+            }
+            emu.mem_write(result_ptr, &ret_ptr, 8);
+        } else {
+            uint64_t null = 0;
+            emu.mem_write(result_ptr, &null, 8);
+        }
+
+        set_reg(emu, UC_ARM64_REG_X0, rc);
+    });
+
+    // ========================================================================
+    // Network database functions (netent)
+    // ========================================================================
+
+    // setnetent - open/rewind networks database
+    hle.register_function("setnetent", [](Emulator& emu) {
+        int stayopen = get_reg(emu, UC_ARM64_REG_X0);
+        ::setnetent(stayopen);
+    });
+
+    // endnetent - close networks database
+    hle.register_function("endnetent", [](Emulator& emu) {
+        ::endnetent();
+    });
+
+    // getnetent - get next network entry
+    hle.register_function("getnetent", [](Emulator& emu) {
+        struct netent* ne = ::getnetent();
+        if (!ne) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        // Allocate and write netent structure
+        static thread_local uint64_t netent_buf = 0;
+        if (!netent_buf) {
+            netent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        uint64_t base = netent_buf;
+        size_t offset = 32;  // After netent struct
+
+        // Copy n_name
+        uint64_t n_name_ptr = base + offset;
+        size_t name_len = strlen(ne->n_name) + 1;
+        emu.mem_write(n_name_ptr, ne->n_name, name_len);
+        offset += name_len;
+
+        // n_aliases (simplified - just null pointer)
+        uint64_t null = 0;
+        uint64_t n_aliases_ptr = base + offset;
+        emu.mem_write(n_aliases_ptr, &null, 8);
+        offset += 8;
+
+        // Write netent struct
+        emu.mem_write(base + 0, &n_name_ptr, 8);      // n_name
+        emu.mem_write(base + 8, &n_aliases_ptr, 8);   // n_aliases
+        int32_t n_addrtype = ne->n_addrtype;
+        emu.mem_write(base + 16, &n_addrtype, 4);     // n_addrtype
+        uint32_t n_net = ne->n_net;
+        emu.mem_write(base + 20, &n_net, 4);          // n_net
+
+        set_reg(emu, UC_ARM64_REG_X0, base);
+    });
+
+    // getnetbyaddr - get network entry by address
+    hle.register_function("getnetbyaddr", [](Emulator& emu) {
+        uint32_t net = get_reg(emu, UC_ARM64_REG_X0);
+        int type = get_reg(emu, UC_ARM64_REG_X1);
+
+        struct netent* ne = ::getnetbyaddr(net, type);
+        if (!ne) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        // Same allocation as getnetent
+        static thread_local uint64_t netent_buf = 0;
+        if (!netent_buf) {
+            netent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        uint64_t base = netent_buf;
+        size_t offset = 32;
+
+        uint64_t n_name_ptr = base + offset;
+        size_t name_len = strlen(ne->n_name) + 1;
+        emu.mem_write(n_name_ptr, ne->n_name, name_len);
+        offset += name_len;
+
+        uint64_t null = 0;
+        uint64_t n_aliases_ptr = base + offset;
+        emu.mem_write(n_aliases_ptr, &null, 8);
+
+        emu.mem_write(base + 0, &n_name_ptr, 8);
+        emu.mem_write(base + 8, &n_aliases_ptr, 8);
+        int32_t n_addrtype = ne->n_addrtype;
+        emu.mem_write(base + 16, &n_addrtype, 4);
+        uint32_t n_net = ne->n_net;
+        emu.mem_write(base + 20, &n_net, 4);
+
+        set_reg(emu, UC_ARM64_REG_X0, base);
+    });
+
+    // getnetbyname - get network entry by name
+    hle.register_function("getnetbyname", [](Emulator& emu) {
+        uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        if (!name_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        std::string name = read_string(emu, name_ptr);
+        struct netent* ne = ::getnetbyname(name.c_str());
+        if (!ne) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t netent_buf = 0;
+        if (!netent_buf) {
+            netent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        uint64_t base = netent_buf;
+        size_t offset = 32;
+
+        uint64_t n_name_ptr = base + offset;
+        size_t name_len = strlen(ne->n_name) + 1;
+        emu.mem_write(n_name_ptr, ne->n_name, name_len);
+        offset += name_len;
+
+        uint64_t null = 0;
+        uint64_t n_aliases_ptr = base + offset;
+        emu.mem_write(n_aliases_ptr, &null, 8);
+
+        emu.mem_write(base + 0, &n_name_ptr, 8);
+        emu.mem_write(base + 8, &n_aliases_ptr, 8);
+        int32_t n_addrtype = ne->n_addrtype;
+        emu.mem_write(base + 16, &n_addrtype, 4);
+        uint32_t n_net = ne->n_net;
+        emu.mem_write(base + 20, &n_net, 4);
+
+        set_reg(emu, UC_ARM64_REG_X0, base);
+    });
+
+    // ========================================================================
+    // Host database functions (hostent enumeration)
+    // ========================================================================
+
+    // sethostent - open/rewind hosts database
+    hle.register_function("sethostent", [](Emulator& emu) {
+        int stayopen = get_reg(emu, UC_ARM64_REG_X0);
+        ::sethostent(stayopen);
+    });
+
+    // endhostent - close hosts database
+    hle.register_function("endhostent", [](Emulator& emu) {
+        ::endhostent();
+    });
+
+    // gethostent - get next host entry
+    hle.register_function("gethostent", [](Emulator& emu) {
+        struct hostent* he = ::gethostent();
+        if (!he) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        // Allocate and write hostent structure (same as gethostbyname)
+        static thread_local uint64_t hostent_buf = 0;
+        if (!hostent_buf) {
+            hostent_buf = emu.memory().heap().allocate(1024, 8);
+        }
+        uint64_t base = hostent_buf;
+        size_t offset = 32;
+
+        uint64_t h_name_ptr = base + offset;
+        size_t name_len = strlen(he->h_name) + 1;
+        emu.mem_write(h_name_ptr, he->h_name, name_len);
+        offset += name_len;
+
+        int num_aliases = 0;
+        while (he->h_aliases && he->h_aliases[num_aliases]) num_aliases++;
+        int num_addrs = 0;
+        while (he->h_addr_list && he->h_addr_list[num_addrs]) num_addrs++;
+
+        uint64_t h_aliases_ptr = base + offset;
+        offset += (num_aliases + 1) * 8;
+        for (int i = 0; i < num_aliases; i++) {
+            uint64_t alias_ptr = base + offset;
+            size_t alen = strlen(he->h_aliases[i]) + 1;
+            emu.mem_write(alias_ptr, he->h_aliases[i], alen);
+            emu.mem_write(h_aliases_ptr + i * 8, &alias_ptr, 8);
+            offset += alen;
+        }
+        uint64_t null_ptr = 0;
+        emu.mem_write(h_aliases_ptr + num_aliases * 8, &null_ptr, 8);
+
+        uint64_t h_addr_list_ptr = base + offset;
+        offset += (num_addrs + 1) * 8;
+        for (int i = 0; i < num_addrs; i++) {
+            uint64_t addr_ptr = base + offset;
+            emu.mem_write(addr_ptr, he->h_addr_list[i], he->h_length);
+            emu.mem_write(h_addr_list_ptr + i * 8, &addr_ptr, 8);
+            offset += he->h_length;
+        }
+        emu.mem_write(h_addr_list_ptr + num_addrs * 8, &null_ptr, 8);
+
+        emu.mem_write(base + 0, &h_name_ptr, 8);
+        emu.mem_write(base + 8, &h_aliases_ptr, 8);
+        int32_t h_addrtype = he->h_addrtype;
+        int32_t h_length = he->h_length;
+        emu.mem_write(base + 16, &h_addrtype, 4);
+        emu.mem_write(base + 20, &h_length, 4);
+        emu.mem_write(base + 24, &h_addr_list_ptr, 8);
+
+        set_reg(emu, UC_ARM64_REG_X0, base);
+    });
+
+    // ========================================================================
+    // Protocol database functions (protoent)
+    // ========================================================================
+
+    // setprotoent - open/rewind protocols database
+    hle.register_function("setprotoent", [](Emulator& emu) {
+        int stayopen = get_reg(emu, UC_ARM64_REG_X0);
+        ::setprotoent(stayopen);
+    });
+
+    // endprotoent - close protocols database
+    hle.register_function("endprotoent", [](Emulator& emu) {
+        ::endprotoent();
+    });
+
+    // Helper to write protoent structure
+    auto write_protoent = [](Emulator& emu, struct protoent* pe, uint64_t base) {
+        if (!pe) return;
+        size_t offset = 24;  // After protoent struct (8+8+4+4padding)
+
+        // Copy p_name
+        uint64_t p_name_ptr = base + offset;
+        size_t name_len = strlen(pe->p_name) + 1;
+        emu.mem_write(p_name_ptr, pe->p_name, name_len);
+        offset += name_len;
+
+        // p_aliases (simplified - just null pointer)
+        uint64_t null = 0;
+        uint64_t p_aliases_ptr = base + offset;
+        emu.mem_write(p_aliases_ptr, &null, 8);
+        offset += 8;
+
+        // Write protoent struct
+        emu.mem_write(base + 0, &p_name_ptr, 8);       // p_name
+        emu.mem_write(base + 8, &p_aliases_ptr, 8);    // p_aliases
+        int32_t p_proto = pe->p_proto;
+        emu.mem_write(base + 16, &p_proto, 4);         // p_proto
+    };
+
+    // getprotoent - get next protocol entry
+    hle.register_function("getprotoent", [write_protoent](Emulator& emu) {
+        struct protoent* pe = ::getprotoent();
+        if (!pe) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t protoent_buf = 0;
+        if (!protoent_buf) {
+            protoent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        write_protoent(emu, pe, protoent_buf);
+        set_reg(emu, UC_ARM64_REG_X0, protoent_buf);
+    });
+
+    // getprotobyname - get protocol entry by name
+    hle.register_function("getprotobyname", [write_protoent](Emulator& emu) {
+        uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        if (!name_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        std::string name = read_string(emu, name_ptr);
+        struct protoent* pe = ::getprotobyname(name.c_str());
+        if (!pe) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t protoent_buf = 0;
+        if (!protoent_buf) {
+            protoent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        write_protoent(emu, pe, protoent_buf);
+        set_reg(emu, UC_ARM64_REG_X0, protoent_buf);
+    });
+
+    // getprotobynumber - get protocol entry by number
+    hle.register_function("getprotobynumber", [write_protoent](Emulator& emu) {
+        int proto = get_reg(emu, UC_ARM64_REG_X0);
+        struct protoent* pe = ::getprotobynumber(proto);
+        if (!pe) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t protoent_buf = 0;
+        if (!protoent_buf) {
+            protoent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        write_protoent(emu, pe, protoent_buf);
+        set_reg(emu, UC_ARM64_REG_X0, protoent_buf);
+    });
+
+    // ========================================================================
+    // Service database functions (servent)
+    // ========================================================================
+
+    // setservent - open/rewind services database
+    hle.register_function("setservent", [](Emulator& emu) {
+        (void)get_reg(emu, UC_ARM64_REG_X0);
+        g_service_enum_index = 0;
+    });
+
+    // endservent - close services database
+    hle.register_function("endservent", [](Emulator& emu) {
+        (void)emu;
+        g_service_enum_index = 0;
+    });
+
+    // getservent - get next service entry
+    hle.register_function("getservent", [](Emulator& emu) {
+        if (g_service_enum_index >= kServiceEntryCount) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t servent_buf = 0;
+        if (!servent_buf) {
+            servent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        write_service_entry(emu, kServiceEntries[g_service_enum_index], servent_buf);
+        ++g_service_enum_index;
+        set_reg(emu, UC_ARM64_REG_X0, servent_buf);
+    });
+
+    // getservbyname - get service entry by name
+    hle.register_function("getservbyname", [](Emulator& emu) {
+        uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t proto_ptr = get_reg(emu, UC_ARM64_REG_X1);
+        if (!name_ptr) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        std::string name = read_string(emu, name_ptr);
+        std::string proto_str;
+        if (proto_ptr) proto_str = read_string(emu, proto_ptr);
+        const char* proto = proto_ptr ? proto_str.c_str() : nullptr;
+
+        const ServiceEntry* entry = find_service_by_name(name, proto);
+        if (!entry) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t servent_buf = 0;
+        if (!servent_buf) {
+            servent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        write_service_entry(emu, *entry, servent_buf);
+        set_reg(emu, UC_ARM64_REG_X0, servent_buf);
+    });
+
+    // getservbyport - get service entry by port
+    hle.register_function("getservbyport", [](Emulator& emu) {
+        int port = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t proto_ptr = get_reg(emu, UC_ARM64_REG_X1);
+
+        std::string proto_str;
+        if (proto_ptr) proto_str = read_string(emu, proto_ptr);
+        const char* proto = proto_ptr ? proto_str.c_str() : nullptr;
+
+        const ServiceEntry* entry = find_service_by_port(port, proto);
+        if (!entry) {
+            set_reg(emu, UC_ARM64_REG_X0, 0);
+            return;
+        }
+
+        static thread_local uint64_t servent_buf = 0;
+        if (!servent_buf) {
+            servent_buf = emu.memory().heap().allocate(512, 8);
+        }
+        write_service_entry(emu, *entry, servent_buf);
+        set_reg(emu, UC_ARM64_REG_X0, servent_buf);
     });
 }
 

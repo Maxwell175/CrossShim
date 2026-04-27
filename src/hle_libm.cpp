@@ -155,4 +155,3 @@ void register_pthread_hle(HleManager& hle) {
 }
 
 } // namespace cross_shim
-

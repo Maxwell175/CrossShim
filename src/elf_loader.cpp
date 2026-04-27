@@ -1,6 +1,7 @@
 #include "elf_loader.h"
 #include "memory_manager.h"
 #include "cross_shim.h"
+#include "debug_log.h"
 #include <LIEF/ELF.hpp>
 #include <iostream>
 #include <algorithm>
@@ -119,6 +120,10 @@ std::vector<RelocationInfo> ElfLoader::get_relocations() const {
     std::vector<RelocationInfo> relocs;
     if (!binary_) return relocs;
 
+    // Count by type for debugging
+    size_t rel_count = 0, relr_count = 0;
+
+    // Get standard relocations from LIEF
     for (const auto& reloc : binary_->relocations()) {
         RelocationInfo info;
         info.offset = reloc.address();
@@ -130,8 +135,20 @@ std::vector<RelocationInfo> ElfLoader::get_relocations() const {
             info.symbol_value = reloc.symbol()->value();
         }
 
+        rel_count++;
         relocs.push_back(info);
     }
+
+    // NOTE: LIEF already parses RELR (packed relative relocations) and returns them
+    // as R_AARCH64_RELATIVE relocations in binary_->relocations(). We do NOT need
+    // to manually parse RELR - doing so would cause double-relocation!
+    //
+    // LIEF handles these RELR tags automatically:
+    // - DT_RELR (36) / DT_RELRSZ (35) - Standard RELR
+    // - DT_LLVM_RELR (0x6fffe000) / DT_LLVM_RELRSZ (0x6fffe001) - LLVM/Android
+    // - DT_ANDROID_RELR (0x6fffff00) / DT_ANDROID_RELRSZ (0x6fffff01) - Older Android
+
+    EMU_LOG << "[ELF] Loaded " << relocs.size() << " relocations (all from LIEF)" << std::endl;
     return relocs;
 }
 

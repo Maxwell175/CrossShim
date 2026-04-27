@@ -1,0 +1,5 @@
+/build/
+/googletest/
+/tests/
+/bionic_repo/
+/bionic_test_results.log

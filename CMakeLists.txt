@@ -52,6 +52,8 @@ set(CROSS_SHIM_SOURCES
     src/hle/hle_memory.cpp
     src/hle/hle_string.cpp
     src/hle/hle_mem_ops.cpp
+    src/hle/hle_format.cpp
+    src/hle/hle_scan.cpp
     src/hle/hle_io.cpp
     src/hle/hle_file.cpp
     src/hle/hle_time.cpp
@@ -64,6 +66,16 @@ set(CROSS_SHIM_SOURCES
     src/hle/hle_syslog.cpp
     src/hle/hle_user.cpp
     src/hle/hle_crypto.cpp
+    # Split from hle_misc.cpp
+    src/hle/hle_stdlib.cpp
+    src/hle/hle_wchar.cpp
+    src/hle/hle_locale.cpp
+    src/hle/hle_ctype.cpp
+    src/hle/hle_signal.cpp
+    src/hle/hle_search.cpp
+    src/hle/hle_sched.cpp
+    src/hle/hle_setjmp.cpp
+    src/hle/hle_sysconf.cpp
 )
 
 # Find OpenSSL
@@ -91,6 +103,7 @@ target_link_libraries(cross_shim PUBLIC
     z
     rt
     m
+    quadmath
     pthread
     OpenSSL::SSL
     OpenSSL::Crypto

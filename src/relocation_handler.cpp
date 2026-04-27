@@ -89,12 +89,16 @@ bool RelocationHandler::process_relocation(
 
         case R_AARCH64_GLOB_DAT: {
             uint64_t value = symbol_value;
+            EMU_LOG << "[RELOC] GLOB_DAT for " << symbol_name << " at 0x" << std::hex << address
+                      << " initial_value=0x" << symbol_value << std::dec << std::endl;
             if (value == 0 && !symbol_name.empty() && resolver) {
                 // Try with original name first, then without version suffix
                 value = resolver(symbol_name);
                 if (value == 0) {
                     value = resolver(strip_version_suffix(symbol_name));
                 }
+                EMU_LOG << "[RELOC] GLOB_DAT resolved " << symbol_name << " to 0x"
+                          << std::hex << value << std::dec << std::endl;
             } else if (value != 0) {
                 value += base_address;
             }
@@ -168,6 +172,28 @@ bool RelocationHandler::process_relocation(
 
 bool RelocationHandler::apply_relative(uint64_t address, uint64_t base, int64_t addend) {
     // R_AARCH64_RELATIVE: S + A (where S = base address)
+    // For RELR relocations, the addend is stored in-place at the address
+    // (addend=0 is passed for RELR entries)
+    if (addend == 0) {
+        // Read the existing value at the address as the addend
+        uint64_t existing = 0;
+        if (!memory_.read(address, &existing, sizeof(existing))) {
+            EMU_LOG << "[RELOC] ERROR: Failed to read existing value for RELATIVE at 0x"
+                      << std::hex << address << std::dec << std::endl;
+            return false;
+        }
+        addend = static_cast<int64_t>(existing);
+
+        // Debug: log first few RELR relocations
+        static int relr_log_count = 0;
+        if (relr_log_count < 10) {
+            EMU_LOG << "[RELOC] RELR at 0x" << std::hex << address
+                      << ": existing=0x" << existing
+                      << " + base=0x" << base
+                      << " = 0x" << (base + addend) << std::dec << std::endl;
+            relr_log_count++;
+        }
+    }
     uint64_t value = base + addend;
     return memory_.write(address, &value, sizeof(value));
 }

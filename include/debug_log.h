@@ -57,7 +57,7 @@ public:
 
 // Master logging switch - set to 1 to enable logging
 #ifndef EMU_LOGGING_ENABLED
-#define EMU_LOGGING_ENABLED 0  // Disabled by default for clean output
+#define EMU_LOGGING_ENABLED 1  // Temporarily enabled for debugging
 #endif
 
 // Macro for thread-safe logging - use like std::cerr
@@ -69,7 +69,7 @@ public:
 
 // Verbose logging - for high-frequency debug output
 #ifndef EMU_VERBOSE_LOGGING
-#define EMU_VERBOSE_LOGGING 0
+#define EMU_VERBOSE_LOGGING 0  // Disabled
 #endif
 
 #if EMU_VERBOSE_LOGGING

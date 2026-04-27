@@ -10,13 +10,19 @@
 #include "hle_manager.h"
 #include "memory_manager.h"
 #include "emu_compat.h"
+#include <cerrno>
 #include <cstring>
 #include <grp.h>
 #include <iostream>
 #include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <pwd.h>
 #include <random>
 #include <fstream>
+#include <vector>
 
 namespace cross_shim {
 
@@ -309,16 +315,49 @@ void register_hle_user(HleManager &hle) {
     // Return reasonable defaults for common aux values
     uint64_t result = 0;
     switch (type) {
+    case 3: { // AT_PHDR
+      if (!emu.modules().empty()) {
+        result = emu.modules().front().base_address + 0x40;
+      } else {
+        result = 0x400040;
+      }
+      break;
+    }
+    case 4: // AT_PHENT
+      result = 56;
+      break;
+    case 5: // AT_PHNUM
+      result = 1;
+      break;
     case 6: // AT_PAGESZ
       result = 4096;
       break;
+    case 9: { // AT_ENTRY
+      if (!emu.modules().empty()) {
+        result = emu.modules().front().base_address;
+      } else {
+        result = 0x400000;
+      }
+      break;
+    }
+    case 11: // AT_UID
+      result = static_cast<uint64_t>(::getuid());
+      break;
+    case 12: // AT_EUID
+      result = static_cast<uint64_t>(::geteuid());
+      break;
+    case 13: // AT_GID
+      result = static_cast<uint64_t>(::getgid());
+      break;
+    case 14: // AT_EGID
+      result = static_cast<uint64_t>(::getegid());
+      break;
     case 16: // AT_HWCAP
-      // Set HWCAP_ATOMICS (bit 8) to indicate LSE atomics support
-      // This allows the runtime to use LDADD/LDCLR/etc. instead of LDXR/STXR
-      // loops
-      result = (1 << 8); // HWCAP_ATOMICS
+      // Do not advertise HWCAP_ATOMICS/LSE here. Some guest paths are stable
+      // with the outlined LDAXR/STLXR fallback but wedge on the LSE fast path.
+      result = 0;
       EMU_LOG << "[HLE] getauxval(AT_HWCAP) returning 0x" << std::hex
-                << result << std::dec << " (HWCAP_ATOMICS)" << std::endl;
+                << result << std::dec << std::endl;
       break;
     case 23:      // AT_SECURE
       result = 0; // Not running setuid
@@ -356,6 +395,7 @@ void register_hle_user(HleManager &hle) {
       result = 0;
       break;
     default:
+      hle_set_errno(emu, ENOENT);
       result = 0;
       break;
     }
@@ -391,23 +431,163 @@ void register_hle_user(HleManager &hle) {
   // Host/service resolution
   // ========================================================================
 
-  hle.register_function("gethostbyname", [](Emulator &emu) {
-    // Return NULL (not supported)
-    set_reg(emu, UC_ARM64_REG_X0, 0);
+  // Static guest memory for hostent result
+  static uint64_t g_hostent_addr = 0;
+  static uint64_t g_hostent_name_addr = 0;
+  static uint64_t g_hostent_aliases_addr = 0;
+  static uint64_t g_hostent_addr_list_addr = 0;
+  static uint64_t g_hostent_addr_addr = 0;
+
+  auto setup_hostent_storage = [](Emulator& emu) {
+    if (g_hostent_addr == 0) {
+      // Allocate: hostent struct (40 bytes), name (256 bytes), aliases ptr (8 bytes),
+      // addr_list ptrs (16 bytes), addr data (16 bytes)
+      g_hostent_addr = emu.memory().heap().allocate(40, 8);
+      g_hostent_name_addr = emu.memory().heap().allocate(256, 1);
+      g_hostent_aliases_addr = emu.memory().heap().allocate(8, 8);
+      g_hostent_addr_list_addr = emu.memory().heap().allocate(16, 8);
+      g_hostent_addr_addr = emu.memory().heap().allocate(16, 4);
+
+      // Initialize aliases to null
+      uint64_t null_ptr = 0;
+      emu.mem_write(g_hostent_aliases_addr, &null_ptr, 8);
+    }
+  };
+
+  hle.register_function("gethostbyname", [setup_hostent_storage](Emulator &emu) {
+    uint64_t name_ptr = get_reg(emu, UC_ARM64_REG_X0);
+    std::string name = read_string(emu, name_ptr);
+
+    // Only handle localhost to avoid blocking DNS lookups
+    if (name != "localhost" && name != "ip6-localhost" && name != "ip6-loopback") {
+      set_reg(emu, UC_ARM64_REG_X0, 0);
+      return;
+    }
+
+    setup_hostent_storage(emu);
+
+    // Return localhost as 127.0.0.1
+    emu.mem_write(g_hostent_name_addr, name.c_str(), name.length() + 1);
+
+    // Set address to 127.0.0.1
+    uint8_t localhost_addr[4] = {127, 0, 0, 1};
+    emu.mem_write(g_hostent_addr_addr, localhost_addr, 4);
+
+    // Set up addr_list pointers: [&addr, null]
+    emu.mem_write(g_hostent_addr_list_addr, &g_hostent_addr_addr, 8);
+    uint64_t null_ptr = 0;
+    emu.mem_write(g_hostent_addr_list_addr + 8, &null_ptr, 8);
+
+    // Build hostent structure
+    emu.mem_write(g_hostent_addr, &g_hostent_name_addr, 8);      // h_name
+    emu.mem_write(g_hostent_addr + 8, &g_hostent_aliases_addr, 8); // h_aliases
+    int32_t addrtype = AF_INET;
+    int32_t length = 4;
+    emu.mem_write(g_hostent_addr + 16, &addrtype, 4);            // h_addrtype
+    emu.mem_write(g_hostent_addr + 20, &length, 4);              // h_length
+    emu.mem_write(g_hostent_addr + 24, &g_hostent_addr_list_addr, 8); // h_addr_list
+
+    set_reg(emu, UC_ARM64_REG_X0, g_hostent_addr);
   });
 
-  hle.register_function(
-      "gethostbyaddr", [](Emulator &emu) { set_reg(emu, UC_ARM64_REG_X0, 0); });
+  hle.register_function("gethostbyaddr", [setup_hostent_storage](Emulator &emu) {
+    uint64_t addr_ptr = get_reg(emu, UC_ARM64_REG_X0);
+    int len = get_reg(emu, UC_ARM64_REG_X1);
+    int type = get_reg(emu, UC_ARM64_REG_X2);
 
-  hle.register_function(
-      "getservbyname", [](Emulator &emu) { set_reg(emu, UC_ARM64_REG_X0, 0); });
+    if (len <= 0 || len > 16) {
+      set_reg(emu, UC_ARM64_REG_X0, 0);
+      return;
+    }
 
-  hle.register_function(
-      "getservbyport", [](Emulator &emu) { set_reg(emu, UC_ARM64_REG_X0, 0); });
+    uint8_t addr_buf[16];
+    emu.mem_read(addr_ptr, addr_buf, len);
+
+    // Only handle localhost (127.0.0.1) to avoid blocking DNS lookups
+    bool is_localhost = false;
+    if (type == AF_INET && len >= 4) {
+      // Check for 127.0.0.1
+      is_localhost = (addr_buf[0] == 127 && addr_buf[1] == 0 && addr_buf[2] == 0 && addr_buf[3] == 1);
+    }
+
+    if (!is_localhost) {
+      // For non-localhost, return NULL to avoid blocking
+      set_reg(emu, UC_ARM64_REG_X0, 0);
+      return;
+    }
+
+    setup_hostent_storage(emu);
+
+    // For localhost, return hardcoded result
+    const char* localhost_name = "localhost";
+    emu.mem_write(g_hostent_name_addr, localhost_name, strlen(localhost_name) + 1);
+
+    // Copy address
+    emu.mem_write(g_hostent_addr_addr, addr_buf, len);
+
+    // Set up addr_list pointers: [&addr, null]
+    emu.mem_write(g_hostent_addr_list_addr, &g_hostent_addr_addr, 8);
+    uint64_t null_ptr = 0;
+    emu.mem_write(g_hostent_addr_list_addr + 8, &null_ptr, 8);
+
+    // Build hostent structure
+    emu.mem_write(g_hostent_addr, &g_hostent_name_addr, 8);      // h_name
+    emu.mem_write(g_hostent_addr + 8, &g_hostent_aliases_addr, 8); // h_aliases
+    int32_t addrtype = type;
+    int32_t length = len;
+    emu.mem_write(g_hostent_addr + 16, &addrtype, 4);            // h_addrtype
+    emu.mem_write(g_hostent_addr + 20, &length, 4);              // h_length
+    emu.mem_write(g_hostent_addr + 24, &g_hostent_addr_list_addr, 8); // h_addr_list
+
+    set_reg(emu, UC_ARM64_REG_X0, g_hostent_addr);
+  });
 
   hle.register_function("getnameinfo", [](Emulator &emu) {
-    // Return error (not supported)
-    set_reg(emu, UC_ARM64_REG_X0, -1);
+    uint64_t sa_ptr = get_reg(emu, UC_ARM64_REG_X0);
+    uint32_t salen = get_reg(emu, UC_ARM64_REG_X1);
+    uint64_t host_ptr = get_reg(emu, UC_ARM64_REG_X2);
+    uint32_t hostlen = get_reg(emu, UC_ARM64_REG_X3);
+    uint64_t serv_ptr = get_reg(emu, UC_ARM64_REG_X4);
+    uint32_t servlen = get_reg(emu, UC_ARM64_REG_X5);
+    int flags = get_reg(emu, UC_ARM64_REG_X6);
+
+    // Read sockaddr
+    std::vector<uint8_t> sa_buf(salen);
+    emu.mem_read(sa_ptr, sa_buf.data(), salen);
+    struct sockaddr* sa = (struct sockaddr*)sa_buf.data();
+
+    // EAI_* error codes (bionic)
+    constexpr int EAI_FAMILY_VALUE = 5;
+
+    // Validate socklen
+    if (sa->sa_family == AF_INET && salen < sizeof(struct sockaddr_in)) {
+      set_reg(emu, UC_ARM64_REG_X0, EAI_FAMILY_VALUE);
+      return;
+    }
+    if (sa->sa_family == AF_INET6 && salen < sizeof(struct sockaddr_in6)) {
+      set_reg(emu, UC_ARM64_REG_X0, EAI_FAMILY_VALUE);
+      return;
+    }
+
+    // Allocate host buffers
+    std::vector<char> host_buf(hostlen + 1);
+    std::vector<char> serv_buf(servlen + 1);
+
+    int result = ::getnameinfo(sa, salen,
+                               host_ptr ? host_buf.data() : nullptr, host_ptr ? hostlen : 0,
+                               serv_ptr ? serv_buf.data() : nullptr, serv_ptr ? servlen : 0,
+                               flags);
+
+    if (result == 0) {
+      if (host_ptr && hostlen > 0) {
+        emu.mem_write(host_ptr, host_buf.data(), strlen(host_buf.data()) + 1);
+      }
+      if (serv_ptr && servlen > 0) {
+        emu.mem_write(serv_ptr, serv_buf.data(), strlen(serv_buf.data()) + 1);
+      }
+    }
+
+    set_reg(emu, UC_ARM64_REG_X0, result);
   });
 
   hle.register_function(
