@@ -4,10 +4,10 @@
  * getaddrinfo, freeaddrinfo, getnameinfo, inet_ntop, inet_pton
  * getsockopt, setsockopt, shutdown, getpeername, getsockname
  *
- * NOTE: With QEMU MTTCG (real parallel threads), all I/O operations use
- * direct blocking calls. Guest threads run on real host threads, so blocking
- * in the HLE handler blocks only that specific host thread - exactly what
- * we want for proper thread semantics.
+ * NOTE: Most I/O operations still use direct blocking calls, but epoll_wait
+ * is routed through ThreadManager's resumable path. Letting guest worker
+ * threads sleep inside QEMU's epoll syscall path has proven unsafe under
+ * CrossShim's mixed host/guest threading model.
  */
 
 #include "debug_log.h"
@@ -19,6 +19,7 @@
 #include "memory_manager.h"
 #include "bionic_types.h"
 #include "emu_compat.h"
+#include "thread_manager.h"
 #include <cstring>
 #include <vector>
 #include <sys/socket.h>
@@ -368,19 +369,13 @@ void register_hle_network(HleManager& hle) {
         uint64_t addr_ptr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t addrlen_ptr = get_reg(emu, UC_ARM64_REG_X2);
 
-        struct sockaddr_storage addr;
-        socklen_t addrlen = sizeof(addr);
+        int result = emu.threads().blocking_accept(sockfd, addr_ptr, addrlen_ptr);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
-        // Direct blocking accept - with MTTCG, this blocks only this host thread
-        int result = ::accept(sockfd, (struct sockaddr*)&addr, &addrlen);
-
-        if (result >= 0) {
-            if (addr_ptr) {
-                emu.mem_write(addr_ptr, &addr, addrlen);
-            }
-            if (addrlen_ptr) {
-                emu.mem_write(addrlen_ptr, &addrlen, sizeof(addrlen));
-            }
+        if (result < 0) {
+            hle_set_errno(emu, errno);
         }
 
         set_reg(emu, UC_ARM64_REG_X0, result);
@@ -407,11 +402,10 @@ void register_hle_network(HleManager& hle) {
             EMU_LOG << "[HLE] send: sockfd=" << sockfd << " len=" << len << std::endl;
         }
 
-        std::vector<char> buf(len);
-        emu.mem_read(buf_ptr, buf.data(), len);
-
-        // Direct blocking send - with MTTCG, this blocks only this host thread
-        ssize_t result = ::send(sockfd, buf.data(), len, flags);
+        ssize_t result = emu.threads().blocking_send(sockfd, buf_ptr, len, flags);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
         if (emu.is_debug()) {
             EMU_LOG << "[HLE] send result: " << result << std::endl;
@@ -434,14 +428,12 @@ void register_hle_network(HleManager& hle) {
                     << " len=" << len << " flags=0x" << std::hex << flags << std::dec << std::endl;
         }
 
-        std::vector<char> buf(len);
+        ssize_t result = emu.threads().blocking_recv(sockfd, buf_ptr, len, flags);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
-        // Direct blocking recv - with MTTCG, this blocks only this host thread
-        ssize_t result = ::recv(sockfd, buf.data(), len, flags);
-
-        if (result > 0) {
-            emu.mem_write(buf_ptr, buf.data(), result);
-        } else if (result < 0) {
+        if (result < 0) {
             hle_set_errno(emu, errno);
         }
 
@@ -460,9 +452,6 @@ void register_hle_network(HleManager& hle) {
         uint64_t dest_addr = get_reg(emu, UC_ARM64_REG_X4);
         socklen_t addrlen = get_reg(emu, UC_ARM64_REG_X5);
 
-        std::vector<char> data(len);
-        emu.mem_read(buf_ptr, data.data(), len);
-
         // If addrlen is 0 but dest_addr is non-null, infer address length from family
         if (dest_addr && addrlen == 0) {
             uint16_t sa_family = 0;
@@ -474,12 +463,10 @@ void register_hle_network(HleManager& hle) {
             }
         }
 
-        std::vector<char> addr_buf(addrlen > 0 ? addrlen : 1);
-        if (dest_addr && addrlen > 0) emu.mem_read(dest_addr, addr_buf.data(), addrlen);
-
-        // Direct blocking sendto - with MTTCG, this blocks only this host thread
-        ssize_t result = ::sendto(sockfd, data.data(), len, flags,
-                                  (dest_addr && addrlen > 0) ? (struct sockaddr*)addr_buf.data() : nullptr, addrlen);
+        ssize_t result = emu.threads().blocking_sendto(sockfd, buf_ptr, len, flags, dest_addr, addrlen);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
         if (result < 0) {
             hle_set_errno(emu, errno);
@@ -501,26 +488,17 @@ void register_hle_network(HleManager& hle) {
                     << " len=" << len << " flags=0x" << std::hex << flags << std::dec << std::endl;
         }
 
-        std::vector<char> data(len);
-        struct sockaddr_storage addr;
-        socklen_t addrlen = sizeof(addr);
-
-        // Direct blocking recvfrom - with MTTCG, this blocks only this host thread
-        ssize_t result = ::recvfrom(sockfd, data.data(), len, flags,
-                                    src_addr ? (struct sockaddr*)&addr : nullptr, &addrlen);
+        ssize_t result = emu.threads().blocking_recvfrom(sockfd, buf_ptr, len, flags, src_addr, addrlen_ptr);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
         if (TRACE_NETWORK_IO && (call_num <= 10 || call_num % 100 == 0)) {
             EMU_LOG << "[HLE-TRACE] recvfrom EXIT #" << call_num << " sockfd=" << sockfd
                     << " result=" << result << std::endl;
         }
 
-        if (result > 0) {
-            emu.mem_write(buf_ptr, data.data(), result);
-            if (src_addr) {
-                emu.mem_write(src_addr, &addr, addrlen);
-            }
-            if (addrlen_ptr) emu.mem_write(addrlen_ptr, &addrlen, sizeof(addrlen));
-        } else if (result < 0) {
+        if (result < 0) {
             // Set errno for the emulated code
             hle_set_errno(emu, errno);
         }
@@ -831,63 +809,35 @@ void register_hle_network(HleManager& hle) {
         }
 
         if (maxevents <= 0 || events_ptr == 0) {
+            hle_set_errno(emu, EINVAL);
             set_reg(emu, UC_ARM64_REG_X0, -1);
             return;
         }
 
-        std::vector<struct epoll_event> host_events(maxevents);
-
-        // Direct blocking epoll_wait - with MTTCG, this blocks only this host thread
-        int result = ::epoll_wait(epfd, host_events.data(), maxevents, timeout);
+        int result = emu.threads().blocking_epoll_wait(epfd, events_ptr, maxevents, timeout);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
         if (TRACE_NETWORK_IO && (call_num <= 50 || call_num % 100 == 0 || result > 0)) {
             EMU_LOG << "[HLE-TRACE] epoll_wait EXIT #" << call_num << " result=" << result;
-            if (result > 0) {
-                EMU_LOG << " events=[";
-                for (int i = 0; i < result && i < 5; i++) {
-                    EMU_LOG << (i > 0 ? "," : "") << "fd=" << host_events[i].data.fd
-                            << ":0x" << std::hex << host_events[i].events << std::dec;
-                }
-                if (result > 5) EMU_LOG << "...+" << (result - 5);
-                EMU_LOG << "]";
-            }
             EMU_LOG << std::endl;
         }
 
-        if (result > 0) {
-            // Convert host events to ARM64 format (16 bytes each) before writing to emulated memory
-            std::vector<epoll_event_arm64> arm64_events(result);
-            for (int i = 0; i < result; i++) {
-                host_to_arm64_epoll_event(host_events[i], arm64_events[i]);
-                if (TRACE_NETWORK_IO && call_num <= 10) {
-                    EMU_LOG << "[HLE-TRACE] epoll_wait #" << call_num << " writing ARM64 event[" << i
-                            << "]: events=0x" << std::hex << arm64_events[i].events
-                            << " data.fd=" << std::dec << arm64_events[i].data.fd
-                            << " at addr=0x" << std::hex << (events_ptr + i * 16) << std::dec << std::endl;
-                }
-            }
-            emu.mem_write(events_ptr, arm64_events.data(), result * sizeof(epoll_event_arm64));
-
-            // Debug: verify written data by reading back
-            if (TRACE_NETWORK_IO && call_num <= 10) {
-                epoll_event_arm64 verify;
-                emu.mem_read(events_ptr, &verify, sizeof(verify));
-                EMU_LOG << "[HLE-TRACE] epoll_wait #" << call_num << " VERIFY readback: events=0x"
-                        << std::hex << verify.events << " padding=0x" << verify._padding
-                        << " data.fd=" << std::dec << verify.data.fd << std::endl;
-            }
+        if (result < 0) {
+            hle_set_errno(emu, errno);
         }
 
         // Count epoll_wait calls that returned with events
-        if (result > 0) {
+        if (result > 0 && emu::is_profile_logging_enabled()) {
             int events_count = ++g_epoll_return_with_events;
             int recv_count = g_recvfrom_call_count.load();
             // Log ratio every 100 epoll events
             if (events_count % 100 == 0) {
-                EMU_LOG << "[STATS] epoll_events=" << events_count
-                        << " recvfrom=" << recv_count
-                        << " ratio=" << (recv_count > 0 ? (float)events_count/recv_count : 0)
-                        << std::endl;
+                EMU_PROFILE_LOG << "[STATS] epoll_events=" << events_count
+                                << " recvfrom=" << recv_count
+                                << " ratio=" << (recv_count > 0 ? (float)events_count/recv_count : 0)
+                                << std::endl;
             }
         }
 
@@ -908,22 +858,18 @@ void register_hle_network(HleManager& hle) {
         // uint64_t sigmask = get_reg(emu, UC_ARM64_REG_X4); // Ignored for now
 
         if (maxevents <= 0 || events_ptr == 0) {
+            hle_set_errno(emu, EINVAL);
             set_reg(emu, UC_ARM64_REG_X0, -1);
             return;
         }
 
-        std::vector<struct epoll_event> host_events(maxevents);
+        int result = emu.threads().blocking_epoll_wait(epfd, events_ptr, maxevents, timeout);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
-        // Direct blocking epoll_wait (signal mask ignored) - with MTTCG, this blocks only this host thread
-        int result = ::epoll_wait(epfd, host_events.data(), maxevents, timeout);
-
-        if (result > 0) {
-            // Convert host events to ARM64 format (16 bytes each) before writing to emulated memory
-            std::vector<epoll_event_arm64> arm64_events(result);
-            for (int i = 0; i < result; i++) {
-                host_to_arm64_epoll_event(host_events[i], arm64_events[i]);
-            }
-            emu.mem_write(events_ptr, arm64_events.data(), result * sizeof(epoll_event_arm64));
+        if (result < 0) {
+            hle_set_errno(emu, errno);
         }
 
         set_reg(emu, UC_ARM64_REG_X0, result);

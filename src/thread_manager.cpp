@@ -13,17 +13,51 @@
 #include "hle_manager.h"
 #include "memory_manager.h"
 #include "emu_compat.h"
+#include "bionic_types.h"
 #include <iostream>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <poll.h>
 #include <vector>
 
 namespace cross_shim {
+
+namespace {
+
+constexpr int kMaxHleEpollWaitSliceMs = 20;
+
+int clamp_hle_epoll_wait_timeout(int timeout_ms) {
+    if (timeout_ms == 0) {
+        return 0;
+    }
+    if (timeout_ms < 0) {
+        return kMaxHleEpollWaitSliceMs;
+    }
+    return std::min(timeout_ms, kMaxHleEpollWaitSliceMs);
+}
+
+bool write_epoll_events_to_guest(Emulator& emu, uint64_t events_ptr,
+                                 const std::vector<struct epoll_event>& host_events,
+                                 int result_count) {
+    if (result_count <= 0) {
+        return true;
+    }
+
+    std::vector<bionic::epoll_event_arm64> guest_events(result_count);
+    for (int i = 0; i < result_count; ++i) {
+        bionic::host_to_arm64_epoll_event(host_events[i], guest_events[i]);
+    }
+
+    return emu.mem_write(events_ptr, guest_events.data(),
+                         result_count * sizeof(bionic::epoll_event_arm64));
+}
+
+}  // namespace
 
 // Thread stack size (1MB per thread)
 constexpr uint64_t THREAD_STACK_SIZE = 0x100000;
@@ -278,6 +312,20 @@ ThreadContext* ThreadManager::select_next_thread() {
     for (auto& pair : threads_) {
         if (pair.second->state == ThreadState::IO_WAIT) {
             int fd = pair.second->io_fd;
+            bool wake_for_timeout = false;
+            if (pair.second->coop_io_type == ThreadContext::CoopIoType::EPOLL_WAIT &&
+                pair.second->coop_io_timeout_ms >= 0) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - pair.second->coop_io_start).count();
+                wake_for_timeout = elapsed >= pair.second->coop_io_timeout_ms;
+            }
+
+            if (wake_for_timeout) {
+                pair.second->state = ThreadState::RUNNABLE;
+                runnable_queue_.push_back(pair.first);
+                continue;
+            }
+
             if (fd >= 0) {
                 struct pollfd pfd;
                 pfd.fd = fd;
@@ -2710,6 +2758,278 @@ void ThreadManager::blocking_send_resume() {
     set_reg(emu_, UC_ARM64_REG_LR, return_addr);
 }
 
+ssize_t ThreadManager::blocking_recvfrom(int sockfd, uint64_t buf_ptr, size_t len, int flags,
+                                         uint64_t addr_ptr, uint64_t addrlen_ptr) {
+    int orig_flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
+
+    std::vector<char> buf(len);
+    struct sockaddr_storage addr {};
+    socklen_t addrlen = sizeof(addr);
+    struct sockaddr* addr_out = addr_ptr ? reinterpret_cast<struct sockaddr*>(&addr) : nullptr;
+    socklen_t* addrlen_out = addr_ptr ? &addrlen : nullptr;
+
+    ssize_t result = ::recvfrom(sockfd, buf.data(), len, flags, addr_out, addrlen_out);
+
+    if (result >= 0) {
+        if (result > 0) {
+            emu_.mem_write(buf_ptr, buf.data(), result);
+        }
+        if (addr_ptr && addrlen_out != nullptr) {
+            emu_.mem_write(addr_ptr, &addr, addrlen);
+        }
+        if (addrlen_ptr) {
+            emu_.mem_write(addrlen_ptr, &addrlen, sizeof(addrlen));
+        }
+        fcntl(sockfd, F_SETFL, orig_flags);
+        return result;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        {
+            std::lock_guard<std::mutex> lock(threads_mutex_);
+            auto it = threads_.find(current_thread_id_);
+            if (it != threads_.end()) {
+                it->second->io_operation = ThreadContext::IoOperation::RECVFROM;
+                it->second->io_fd = sockfd;
+                it->second->io_buf_ptr = buf_ptr;
+                it->second->io_len = len;
+                it->second->io_flags = flags;
+                it->second->io_addr_ptr = addr_ptr;
+                it->second->io_addrlen_ptr = addrlen_ptr;
+                it->second->io_return_addr = get_reg(emu_, UC_ARM64_REG_LR);
+                it->second->registers.pc = HLE_BASE + 0xFFFCC;
+            }
+        }
+
+        fcntl(sockfd, F_SETFL, orig_flags);
+        block_current_thread(ThreadState::IO_WAIT, sockfd);
+        context_switch(SwitchReason::BLOCKING_OPERATION);
+        return CONTEXT_SWITCH_OCCURRED;
+    }
+
+    fcntl(sockfd, F_SETFL, orig_flags);
+    return result;
+}
+
+void ThreadManager::blocking_recvfrom_resume() {
+    int sockfd;
+    uint64_t buf_ptr;
+    size_t len;
+    int flags;
+    uint64_t addr_ptr;
+    uint64_t addrlen_ptr;
+    uint64_t return_addr;
+
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        auto it = threads_.find(current_thread_id_);
+        if (it == threads_.end()) return;
+
+        sockfd = it->second->io_fd;
+        buf_ptr = it->second->io_buf_ptr;
+        len = it->second->io_len;
+        flags = it->second->io_flags;
+        addr_ptr = it->second->io_addr_ptr;
+        addrlen_ptr = it->second->io_addrlen_ptr;
+        return_addr = it->second->io_return_addr;
+
+        it->second->io_operation = ThreadContext::IoOperation::NONE;
+        it->second->io_fd = -1;
+        it->second->io_addr_ptr = 0;
+        it->second->io_addrlen_ptr = 0;
+    }
+
+    int orig_flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
+
+    std::vector<char> buf(len);
+    struct sockaddr_storage addr {};
+    socklen_t addrlen = sizeof(addr);
+    struct sockaddr* addr_out = addr_ptr ? reinterpret_cast<struct sockaddr*>(&addr) : nullptr;
+    socklen_t* addrlen_out = addr_ptr ? &addrlen : nullptr;
+
+    ssize_t result = ::recvfrom(sockfd, buf.data(), len, flags, addr_out, addrlen_out);
+
+    if (result >= 0) {
+        if (result > 0) {
+            emu_.mem_write(buf_ptr, buf.data(), result);
+        }
+        if (addr_ptr && addrlen_out != nullptr) {
+            emu_.mem_write(addr_ptr, &addr, addrlen);
+        }
+        if (addrlen_ptr) {
+            emu_.mem_write(addrlen_ptr, &addrlen, sizeof(addrlen));
+        }
+        fcntl(sockfd, F_SETFL, orig_flags);
+        set_reg(emu_, UC_ARM64_REG_X0, result);
+        set_reg(emu_, UC_ARM64_REG_LR, return_addr);
+        return;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        {
+            std::lock_guard<std::mutex> lock(threads_mutex_);
+            auto it = threads_.find(current_thread_id_);
+            if (it != threads_.end()) {
+                it->second->io_operation = ThreadContext::IoOperation::RECVFROM;
+                it->second->io_fd = sockfd;
+                it->second->io_buf_ptr = buf_ptr;
+                it->second->io_len = len;
+                it->second->io_flags = flags;
+                it->second->io_addr_ptr = addr_ptr;
+                it->second->io_addrlen_ptr = addrlen_ptr;
+                it->second->io_return_addr = return_addr;
+                it->second->registers.pc = HLE_BASE + 0xFFFCC;
+            }
+        }
+
+        fcntl(sockfd, F_SETFL, orig_flags);
+        block_current_thread(ThreadState::IO_WAIT, sockfd);
+        context_switch(SwitchReason::BLOCKING_OPERATION);
+        return;
+    }
+
+    fcntl(sockfd, F_SETFL, orig_flags);
+    set_reg(emu_, UC_ARM64_REG_X0, result);
+    set_reg(emu_, UC_ARM64_REG_LR, return_addr);
+}
+
+ssize_t ThreadManager::blocking_sendto(int sockfd, uint64_t buf_ptr, size_t len, int flags,
+                                       uint64_t addr_ptr, uint64_t addrlen) {
+    std::vector<char> buf(len);
+    emu_.mem_read(buf_ptr, buf.data(), len);
+
+    std::vector<char> addr_buf(addr_ptr && addrlen > 0 ? addrlen : 1);
+    if (addr_ptr && addrlen > 0) {
+        emu_.mem_read(addr_ptr, addr_buf.data(), addrlen);
+    }
+
+    int orig_flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
+
+    ssize_t result = ::sendto(
+        sockfd,
+        buf.data(),
+        len,
+        flags,
+        (addr_ptr && addrlen > 0) ? reinterpret_cast<struct sockaddr*>(addr_buf.data()) : nullptr,
+        static_cast<socklen_t>(addrlen));
+
+    if (result >= 0) {
+        fcntl(sockfd, F_SETFL, orig_flags);
+        return result;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        {
+            std::lock_guard<std::mutex> lock(threads_mutex_);
+            auto it = threads_.find(current_thread_id_);
+            if (it != threads_.end()) {
+                it->second->io_operation = ThreadContext::IoOperation::SENDTO;
+                it->second->io_fd = sockfd;
+                it->second->io_buf_ptr = buf_ptr;
+                it->second->io_len = len;
+                it->second->io_flags = flags;
+                it->second->io_addr_ptr = addr_ptr;
+                it->second->io_addrlen_ptr = addrlen;
+                it->second->io_return_addr = get_reg(emu_, UC_ARM64_REG_LR);
+                it->second->registers.pc = HLE_BASE + 0xFFFD0;
+            }
+        }
+
+        fcntl(sockfd, F_SETFL, orig_flags);
+        block_current_thread(ThreadState::IO_WAIT, sockfd);
+        context_switch(SwitchReason::BLOCKING_OPERATION);
+        return CONTEXT_SWITCH_OCCURRED;
+    }
+
+    fcntl(sockfd, F_SETFL, orig_flags);
+    return result;
+}
+
+void ThreadManager::blocking_sendto_resume() {
+    int sockfd;
+    uint64_t buf_ptr;
+    size_t len;
+    int flags;
+    uint64_t addr_ptr;
+    uint64_t addrlen;
+    uint64_t return_addr;
+
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        auto it = threads_.find(current_thread_id_);
+        if (it == threads_.end()) return;
+
+        sockfd = it->second->io_fd;
+        buf_ptr = it->second->io_buf_ptr;
+        len = it->second->io_len;
+        flags = it->second->io_flags;
+        addr_ptr = it->second->io_addr_ptr;
+        addrlen = it->second->io_addrlen_ptr;
+        return_addr = it->second->io_return_addr;
+
+        it->second->io_operation = ThreadContext::IoOperation::NONE;
+        it->second->io_fd = -1;
+        it->second->io_addr_ptr = 0;
+        it->second->io_addrlen_ptr = 0;
+    }
+
+    std::vector<char> buf(len);
+    emu_.mem_read(buf_ptr, buf.data(), len);
+
+    std::vector<char> addr_buf(addr_ptr && addrlen > 0 ? addrlen : 1);
+    if (addr_ptr && addrlen > 0) {
+        emu_.mem_read(addr_ptr, addr_buf.data(), addrlen);
+    }
+
+    int orig_flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
+
+    ssize_t result = ::sendto(
+        sockfd,
+        buf.data(),
+        len,
+        flags,
+        (addr_ptr && addrlen > 0) ? reinterpret_cast<struct sockaddr*>(addr_buf.data()) : nullptr,
+        static_cast<socklen_t>(addrlen));
+
+    if (result >= 0) {
+        fcntl(sockfd, F_SETFL, orig_flags);
+        set_reg(emu_, UC_ARM64_REG_X0, result);
+        set_reg(emu_, UC_ARM64_REG_LR, return_addr);
+        return;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        {
+            std::lock_guard<std::mutex> lock(threads_mutex_);
+            auto it = threads_.find(current_thread_id_);
+            if (it != threads_.end()) {
+                it->second->io_operation = ThreadContext::IoOperation::SENDTO;
+                it->second->io_fd = sockfd;
+                it->second->io_buf_ptr = buf_ptr;
+                it->second->io_len = len;
+                it->second->io_flags = flags;
+                it->second->io_addr_ptr = addr_ptr;
+                it->second->io_addrlen_ptr = addrlen;
+                it->second->io_return_addr = return_addr;
+                it->second->registers.pc = HLE_BASE + 0xFFFD0;
+            }
+        }
+
+        fcntl(sockfd, F_SETFL, orig_flags);
+        block_current_thread(ThreadState::IO_WAIT, sockfd);
+        context_switch(SwitchReason::BLOCKING_OPERATION);
+        return;
+    }
+
+    fcntl(sockfd, F_SETFL, orig_flags);
+    set_reg(emu_, UC_ARM64_REG_X0, result);
+    set_reg(emu_, UC_ARM64_REG_LR, return_addr);
+}
+
 int ThreadManager::blocking_accept(int sockfd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     // Set socket to non-blocking
     int orig_flags = fcntl(sockfd, F_GETFL, 0);
@@ -2828,6 +3148,68 @@ void ThreadManager::blocking_accept_resume() {
     fcntl(sockfd, F_SETFL, orig_flags);
     uint64_t res = result;
     set_reg(emu_, UC_ARM64_REG_X0, res);
+    set_reg(emu_, UC_ARM64_REG_LR, return_addr);
+}
+
+int ThreadManager::blocking_epoll_wait(int epfd, uint64_t events_ptr, int maxevents, int timeout_ms) {
+    if (maxevents <= 0 || events_ptr == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    std::vector<struct epoll_event> host_events(maxevents);
+    errno = 0;
+    const int host_timeout_ms = clamp_hle_epoll_wait_timeout(timeout_ms);
+    const int result = ::epoll_wait(epfd, host_events.data(), maxevents, host_timeout_ms);
+
+    if (result > 0 && !write_epoll_events_to_guest(emu_, events_ptr, host_events, result)) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    return result;
+}
+
+void ThreadManager::blocking_epoll_wait_resume() {
+    int epfd;
+    uint64_t events_ptr;
+    int maxevents;
+    int timeout_ms;
+    uint64_t return_addr;
+    std::chrono::steady_clock::time_point start_time;
+
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        auto it = threads_.find(current_thread_id_);
+        if (it == threads_.end()) return;
+
+        epfd = it->second->coop_io_fd;
+        events_ptr = it->second->coop_io_events_ptr;
+        maxevents = it->second->coop_io_maxevents;
+        timeout_ms = it->second->coop_io_timeout_ms;
+        return_addr = it->second->coop_io_return_addr;
+        start_time = it->second->coop_io_start;
+
+        it->second->io_operation = ThreadContext::IoOperation::NONE;
+        it->second->io_fd = -1;
+        it->second->coop_io_type = ThreadContext::CoopIoType::NONE;
+        it->second->coop_io_fd = -1;
+        it->second->coop_io_events_ptr = 0;
+        it->second->coop_io_maxevents = 0;
+        it->second->coop_io_timeout_ms = 0;
+        it->second->coop_io_return_addr = 0;
+    }
+
+    (void)start_time;
+
+    const int result = blocking_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
+    if (result < 0) {
+        hle_set_errno(emu_, errno);
+    }
+    set_reg(emu_, UC_ARM64_REG_X0, -1);
+    if (result >= 0) {
+        set_reg(emu_, UC_ARM64_REG_X0, result);
+    }
     set_reg(emu_, UC_ARM64_REG_LR, return_addr);
 }
 

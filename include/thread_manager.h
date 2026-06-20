@@ -295,8 +295,16 @@ public:
     void blocking_recv_resume();
     ssize_t blocking_send(int sockfd, uint64_t buf_ptr, size_t len, int flags);
     void blocking_send_resume();
+    ssize_t blocking_recvfrom(int sockfd, uint64_t buf_ptr, size_t len, int flags,
+                              uint64_t addr_ptr, uint64_t addrlen_ptr);
+    void blocking_recvfrom_resume();
+    ssize_t blocking_sendto(int sockfd, uint64_t buf_ptr, size_t len, int flags,
+                            uint64_t addr_ptr, uint64_t addrlen);
+    void blocking_sendto_resume();
     int blocking_accept(int sockfd, uint64_t addr_ptr, uint64_t addrlen_ptr);
     void blocking_accept_resume();
+    int blocking_epoll_wait(int epfd, uint64_t events_ptr, int maxevents, int timeout_ms);
+    void blocking_epoll_wait_resume();
     ssize_t blocking_read(int fd, uint64_t buf_ptr, size_t count);
     void blocking_read_resume();
     ssize_t blocking_write(int fd, uint64_t buf_ptr, size_t count);
