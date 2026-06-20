@@ -1246,9 +1246,13 @@ static HleScanResult scan_with_source(Emulator& emu, uint64_t input_addr, uint64
     std::string fmt = wide_strings ? read_wide_string_utf8(emu, fmt_addr) : read_c_string(emu, fmt_addr);
     ScanParseResult parsed = parse_scan_format(fmt);
     if (!parsed.fatal_message.empty()) {
-        std::fprintf(stderr, "%s is unsupported\n", parsed.fatal_message.c_str());
+        // Generic HLE must never abort the whole process on guest-controlled input.
+        // An unsupported format string makes only this scanf call fail (EOF) so the
+        // calling session sees a normal failure instead of every camera dying.
+        std::fprintf(stderr, "[HLE] scanf: unsupported format token (%s); failing call\n",
+                     parsed.fatal_message.c_str());
         std::fflush(stderr);
-        std::abort();
+        return {.ok = false, .result = -1, .error = parsed.error};
     }
     if (!parsed.ok) {
         return {.ok = false, .result = -1, .error = parsed.error};
