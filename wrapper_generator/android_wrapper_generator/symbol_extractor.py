@@ -68,6 +68,7 @@ class SymbolExtractor:
             ndk_path: Path to the Android NDK toolchain bin directory.
                       If None, will try to find it from environment.
         """
+        self._explicit_ndk_path = ndk_path is not None
         self.ndk_path = Path(ndk_path) if ndk_path else self._find_ndk_path()
         self._validate_ndk_tools()
     
@@ -89,7 +90,7 @@ class SymbolExtractor:
         )
     
     def _validate_ndk_tools(self) -> None:
-        """Validate that required NDK tools exist (or fall back to system tools)."""
+        """Validate that required NDK tools exist."""
         import shutil
 
         required_tools = ["llvm-nm", "llvm-readelf"]
@@ -100,6 +101,10 @@ class SymbolExtractor:
             if tool_path.exists():
                 self._tool_paths[tool] = tool_path
             else:
+                if self._explicit_ndk_path:
+                    raise FileNotFoundError(
+                        f"Required tool not found: {tool_path}"
+                    )
                 # Try to find system tool
                 system_tool = shutil.which(tool)
                 if system_tool:

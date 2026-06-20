@@ -15,8 +15,8 @@ fi
 # Activate venv
 source .venv/bin/activate
 
-# Install package in dev mode if needed
-if ! pip show android-wrapper-generator &>/dev/null; then
+# Install package and test deps in dev mode if needed
+if ! pip show android-wrapper-generator &>/dev/null || ! python -c "import pytest" &>/dev/null; then
     echo "Installing package in development mode..."
     pip install -e ".[dev]"
 fi
@@ -24,4 +24,3 @@ fi
 # Run tests
 echo "Running tests..."
 python -m pytest tests/ -v "$@"
-
