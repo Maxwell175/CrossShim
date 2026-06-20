@@ -17,6 +17,7 @@
 #include "hle_mmap_state.h"
 #include "hle_sched_state.h"
 #include "hle_signal_state.h"
+#include "hle_virtual_threads.h"
 #include "cross_shim.h"
 #include "memory_manager.h"
 #include "qemu_api.h"
@@ -79,6 +80,8 @@ struct QemuThread {
     // Thread completion tracking
     std::atomic<bool> started{false};
     std::atomic<bool> completed{false};
+    std::atomic<bool> exit_reported{false};
+    std::atomic<pid_t> visible_tid{0};
     uint64_t return_value{0};
 
     // For pthread_join to wait on completion
@@ -93,8 +96,6 @@ static std::atomic<uint64_t> g_next_thread_id{0x1000};
 static std::string g_main_thread_name{"thread"};
 static int g_main_thread_sched_policy{SCHED_OTHER};
 static int g_main_thread_sched_priority{0};
-static std::mutex g_guest_tid_map_mutex;
-static std::unordered_map<uint64_t, pid_t> g_guest_tid_map;
 
 // Thread-local current thread ID
 static thread_local uint64_t tl_current_thread_id = 0;
@@ -521,19 +522,41 @@ static bool read_guest_absolute_timespec(Emulator& emu, uint64_t guest_abstime_a
 }
 
 static int wait_cond_with_clock(HostCondVar& cv, HostMutex& mtx, int clockid,
-                                const struct timespec* abstime) {
+                                const struct timespec* abstime, uint64_t visible_tid) {
+    if (!is_valid_guest_cond_clock(clockid)) {
+        return EINVAL;
+    }
+
+    int held_count = mtx.lock_count.load();
+    if (held_count <= 0 || mtx.owner_thread.load() != visible_tid) {
+        return EPERM;
+    }
+
+    // condition_variable_any releases and reacquires the underlying host mutex,
+    // so our synthetic ownership bookkeeping must mirror that handoff.
+    mtx.owner_thread.store(0);
+    mtx.lock_count.store(0);
+
+    auto restore_ownership = [&]() {
+        mtx.owner_thread.store(visible_tid);
+        mtx.lock_count.store(held_count);
+    };
+
     if (abstime == nullptr) {
         cv.cv.wait(mtx.mtx);
+        restore_ownership();
         return 0;
     }
 
     std::chrono::steady_clock::time_point deadline;
     int deadline_result = prepare_rwlock_deadline(abstime, clockid, deadline);
     if (deadline_result != 0) {
+        restore_ownership();
         return deadline_result;
     }
 
     auto status = cv.cv.wait_until(mtx.mtx, deadline);
+    restore_ownership();
     return status == std::cv_status::timeout ? ETIMEDOUT : 0;
 }
 
@@ -545,12 +568,30 @@ static uint64_t get_current_host_thread_token() {
 #endif
 }
 
-static void note_guest_visible_tid(uint64_t pthread_id, pid_t tid) {
-    if (pthread_id == 0 || tid <= 0) {
+static pid_t get_current_host_visible_tid() {
+    uint64_t token = get_current_host_thread_token();
+    if (token == 0 || token > static_cast<uint64_t>(std::numeric_limits<pid_t>::max())) {
+        return 0;
+    }
+    return static_cast<pid_t>(token);
+}
+
+static void remember_thread_visible_tid_locked(uint64_t pthread_id, pid_t tid) {
+    if (pthread_id <= 1 || tid <= 0) {
         return;
     }
-    std::lock_guard<std::mutex> lock(g_guest_tid_map_mutex);
-    g_guest_tid_map[pthread_id] = tid;
+    auto it = g_threads.find(pthread_id);
+    if (it != g_threads.end()) {
+        it->second->visible_tid.store(tid, std::memory_order_release);
+    }
+}
+
+static void remember_thread_visible_tid(uint64_t pthread_id, pid_t tid) {
+    if (pthread_id <= 1 || tid <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_threads_mutex);
+    remember_thread_visible_tid_locked(pthread_id, tid);
 }
 
 static bool timespec_to_ns(const struct timespec& ts, int64_t& out_ns) {
@@ -976,6 +1017,14 @@ static constexpr uint64_t QEMU_THREAD_STACK_BASE = 0x90000000;
 static constexpr uint64_t QEMU_THREAD_TLS_BASE = 0xD0000000;
 static constexpr uint64_t SAFE_CALL_STACK_BASE_GUEST = 0xA0000000ULL;
 static constexpr uint64_t SAFE_CALL_STACK_SIZE_GUEST = 0x00800000ULL;
+// Upper bounds of the per-thread arenas. A fresh (non-recycled) allocation must never
+// cross these: thread stacks (1MB each from 0x90000000) must not collide into the
+// safe-call stack at 0xA0000000, and TLS (64KB each from 0xD0000000) stays below
+// 0xE0000000. Recycling exited threads' regions (see freelists below) keeps us far
+// from these ceilings under sustained reconnect churn; the checks turn genuine
+// exhaustion into a clean pthread_create(EAGAIN) failure instead of memory corruption.
+static constexpr uint64_t QEMU_THREAD_STACK_CEILING = SAFE_CALL_STACK_BASE_GUEST; // 0xA0000000
+static constexpr uint64_t QEMU_THREAD_TLS_CEILING   = 0xE0000000ULL;
 static constexpr uint64_t GUEST_PTHREAD_MUTEX_SIZE = 10 * sizeof(int32_t);
 static constexpr uint64_t GUEST_PTHREAD_MUTEX_ATTR_SIZE = sizeof(int64_t);
 static constexpr uint64_t GUEST_PTHREAD_ATTR_SIZE = 64;
@@ -1064,6 +1113,11 @@ static uint64_t get_thread_id_from_sp(uint64_t sp) {
 }
 
 static uint64_t get_current_guest_pthread_id(Emulator& emu) {
+    uint64_t virtual_tid = hle_virtual_thread_current_override();
+    if (virtual_tid != 0) {
+        return virtual_tid;
+    }
+
     uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
     if (is_safe_call_stack_sp(sp)) {
         return (tl_current_thread_id == 0) ? 1 : tl_current_thread_id;
@@ -1079,20 +1133,37 @@ uint64_t hle_get_current_pthread_id(Emulator& emu) {
     return get_current_guest_pthread_id(emu);
 }
 
+static uint64_t get_current_sync_thread_id(Emulator& emu) {
+    return get_current_guest_pthread_id(emu);
+}
+
 pid_t hle_get_current_visible_tid(Emulator& emu) {
     uint64_t pthread_id = get_current_guest_pthread_id(emu);
-    pid_t tid = 0;
-    if (pthread_id == 1) {
-        tid = ::getpid();
-    } else {
-#ifdef SYS_gettid
-        tid = static_cast<pid_t>(::syscall(SYS_gettid));
-#else
-        tid = static_cast<pid_t>(pthread_id);
-#endif
+    if (pthread_id == 0) {
+        return 0;
     }
 
-    note_guest_visible_tid(pthread_id, tid);
+    pid_t tid = 0;
+    if (hle_virtual_thread_is_virtual(pthread_id)) {
+        if (pthread_id <= static_cast<uint64_t>(std::numeric_limits<pid_t>::max())) {
+            tid = static_cast<pid_t>(pthread_id);
+        }
+    } else if (pthread_id == 1) {
+        tid = ::getpid();
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(g_threads_mutex);
+            auto it = g_threads.find(pthread_id);
+            if (it != g_threads.end()) {
+                tid = it->second->visible_tid.load(std::memory_order_acquire);
+            }
+        }
+        if (tid <= 0) {
+            tid = get_current_host_visible_tid();
+            remember_thread_visible_tid(pthread_id, tid);
+        }
+    }
+
     hle_sched_note_thread_tid(tid);
     return tid;
 }
@@ -1101,40 +1172,44 @@ pid_t hle_lookup_pthread_tid(Emulator& emu, uint64_t pthread_id) {
     if (pthread_id == 0) {
         return 0;
     }
+    if (hle_virtual_thread_is_virtual(pthread_id)) {
+        if (pthread_id <= static_cast<uint64_t>(std::numeric_limits<pid_t>::max())) {
+            return static_cast<pid_t>(pthread_id);
+        }
+        return 0;
+    }
     if (pthread_id == 1) {
         pid_t tid = ::getpid();
-        note_guest_visible_tid(pthread_id, tid);
         hle_sched_note_thread_tid(tid);
         return tid;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(g_guest_tid_map_mutex);
-        auto it = g_guest_tid_map.find(pthread_id);
-        if (it != g_guest_tid_map.end()) {
-            return it->second;
-        }
-    }
-
-    if (pthread_id == get_current_guest_pthread_id(emu)) {
-        return hle_get_current_visible_tid(emu);
-    }
-
+    pid_t cached_tid = 0;
     uint64_t parent_tid_addr = 0;
     uint64_t child_tid_addr = 0;
     {
         std::lock_guard<std::mutex> lock(g_threads_mutex);
         auto it = g_threads.find(pthread_id);
         if (it != g_threads.end()) {
+            cached_tid = it->second->visible_tid.load(std::memory_order_acquire);
             parent_tid_addr = it->second->stack_base + 24;
             child_tid_addr = it->second->stack_base + 32;
         }
     }
 
+    if (cached_tid > 0) {
+        hle_sched_note_thread_tid(cached_tid);
+        return cached_tid;
+    }
+
+    if (pthread_id == get_current_sync_thread_id(emu)) {
+        return hle_get_current_visible_tid(emu);
+    }
+
     if (parent_tid_addr != 0) {
         int32_t tid = 0;
         if (emu.mem_read(parent_tid_addr, &tid, sizeof(tid)) && tid > 0) {
-            note_guest_visible_tid(pthread_id, tid);
+            remember_thread_visible_tid(pthread_id, tid);
             hle_sched_note_thread_tid(tid);
             return static_cast<pid_t>(tid);
         }
@@ -1143,7 +1218,7 @@ pid_t hle_lookup_pthread_tid(Emulator& emu, uint64_t pthread_id) {
     if (child_tid_addr != 0) {
         int32_t tid = 0;
         if (emu.mem_read(child_tid_addr, &tid, sizeof(tid)) && tid > 0) {
-            note_guest_visible_tid(pthread_id, tid);
+            remember_thread_visible_tid(pthread_id, tid);
             hle_sched_note_thread_tid(tid);
             return static_cast<pid_t>(tid);
         }
@@ -1282,6 +1357,11 @@ static void finish_guest_pthread_exit(Emulator& emu, uint64_t thread_id, uint64_
 }
 
 static uint64_t get_current_tls_thread_id(Emulator& emu) {
+    uint64_t virtual_tid = hle_virtual_thread_current_override();
+    if (virtual_tid != 0) {
+        return virtual_tid;
+    }
+
     uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
     if (is_safe_call_stack_sp(sp)) {
         if (tl_current_thread_id == 0 || tl_current_thread_id == 1) {
@@ -1514,42 +1594,129 @@ static bool is_valid_tls_key_locked(uint64_t key) {
 static std::atomic<uint64_t> g_next_stack_addr{QEMU_THREAD_STACK_BASE};
 static std::atomic<uint64_t> g_next_tls_addr{QEMU_THREAD_TLS_BASE};
 
+// Freelists of exited threads' region base addresses (the raw `addr` the bump allocator
+// produced, NOT the returned stack_top/tls_base). Recycling these is what bounds the
+// arenas: without it every camera reconnect permanently consumes a 1MB stack slot and
+// the 0x90000000..0xA0000000 arena exhausts after ~256 thread creations, which under
+// sustained multi-camera reconnect churn manifests as periodic crashes / cameras that
+// can no longer reconnect (AV_ER_FAIL_CREATE_THREAD). The region memory stays mapped
+// after a thread exits, so a recycled region is reused WITHOUT re-mapping.
+static std::mutex g_thread_arena_mutex;
+static std::vector<uint64_t> g_free_stack_region_bases;
+static std::vector<uint64_t> g_free_tls_region_bases;
+
 // Thread exit address - special HLE address that terminates thread
 static constexpr uint64_t THREAD_EXIT_ADDR = 0x100FFFF0;
 
-// Allocate stack for a new thread
+// Allocate stack for a new thread (reuses an exited thread's region when available).
 static uint64_t allocate_thread_stack(Emulator& emu) {
-    uint64_t addr = g_next_stack_addr.fetch_add(QEMU_THREAD_STACK_SIZE);
+    uint64_t addr;
+    bool recycled = false;
+    {
+        std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+        if (!g_free_stack_region_bases.empty()) {
+            addr = g_free_stack_region_bases.back();
+            g_free_stack_region_bases.pop_back();
+            recycled = true;
+        } else {
+            // Reserve a fresh slot, but never cross into the safe-call stack arena.
+            uint64_t next = g_next_stack_addr.load(std::memory_order_relaxed);
+            if (next + QEMU_THREAD_STACK_SIZE > QEMU_THREAD_STACK_CEILING) {
+                EMU_ALWAYS_LOG << "[HLE] allocate_thread_stack: arena exhausted at 0x"
+                               << std::hex << next << std::dec
+                               << " (live threads too high); failing pthread_create" << std::endl;
+                return 0;
+            }
+            addr = g_next_stack_addr.fetch_add(QEMU_THREAD_STACK_SIZE);
+        }
+    }
     uint64_t stack_top = addr + QEMU_THREAD_STACK_SIZE - 0x100;
     if (!hle_try_reserve_vmas(stack_top, 2)) {
+        if (recycled) {
+            std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+            g_free_stack_region_bases.push_back(addr);
+        }
         return 0;
     }
-    if (!emu.memory().map(addr, QEMU_THREAD_STACK_SIZE, MEM_READ | MEM_WRITE)) {
+    // Recycled regions are already mapped (we never unmap on thread exit); only fresh
+    // regions need mapping.
+    if (!recycled && !emu.memory().map(addr, QEMU_THREAD_STACK_SIZE, MEM_READ | MEM_WRITE)) {
         hle_release_vmas(stack_top);
+        std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+        g_free_stack_region_bases.push_back(addr);
         return 0;
     }
     return stack_top;  // Return top of stack minus some space
 }
 
-// Allocate TLS for a new thread
+// Allocate TLS for a new thread (reuses an exited thread's region when available).
 static uint64_t allocate_thread_tls(Emulator& emu) {
-    uint64_t addr = g_next_tls_addr.fetch_add(QEMU_THREAD_TLS_SIZE);
+    uint64_t addr;
+    bool recycled = false;
+    {
+        std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+        if (!g_free_tls_region_bases.empty()) {
+            addr = g_free_tls_region_bases.back();
+            g_free_tls_region_bases.pop_back();
+            recycled = true;
+        } else {
+            uint64_t next = g_next_tls_addr.load(std::memory_order_relaxed);
+            if (next + QEMU_THREAD_TLS_SIZE > QEMU_THREAD_TLS_CEILING) {
+                EMU_ALWAYS_LOG << "[HLE] allocate_thread_tls: TLS arena exhausted at 0x"
+                               << std::hex << next << std::dec << "; failing pthread_create" << std::endl;
+                return 0;
+            }
+            addr = g_next_tls_addr.fetch_add(QEMU_THREAD_TLS_SIZE);
+        }
+    }
     uint64_t tls_base = addr + 8;
     if (!hle_try_reserve_vmas(tls_base, 1)) {
+        if (recycled) {
+            std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+            g_free_tls_region_bases.push_back(addr);
+        }
         return 0;
     }
-    if (!emu.memory().map(addr, QEMU_THREAD_TLS_SIZE, MEM_READ | MEM_WRITE)) {
+    if (!recycled && !emu.memory().map(addr, QEMU_THREAD_TLS_SIZE, MEM_READ | MEM_WRITE)) {
         hle_release_vmas(tls_base);
+        std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+        g_free_tls_region_bases.push_back(addr);
         return 0;
     }
 
-    // Initialize TLS with stack canary at offset 0x28
+    // Initialize TLS with stack canary at offset 0x28 (re-init every time, including on
+    // recycle, since a prior thread may have left stale bytes here).
     uint64_t canary = 0xDEADBEEFCAFEBABEULL;
     emu.mem_write(addr + 0x28, &canary, sizeof(canary));
     emu.mem_write(addr + 0x30, &canary, sizeof(canary));
 
     // Return TLS base + 8 (the value for TPIDR_EL0)
     return tls_base;
+}
+
+// Return an exited thread's arena regions to the freelists so the next pthread_create
+// can reuse them. A stack is recycled ONLY if its region base falls within OUR arena
+// address range — guest-provided custom stacks (allocated from the guest heap) land
+// outside the range and are never touched. NOTE: guest_stack_addr is NOT a reliable
+// "custom stack" flag (pthread_create sets it to a computed value for arena stacks too),
+// so we key purely on the address range. MUST be called AFTER the thread's g_threads
+// entry has been erased, so no live entry shares the recycled stack's SP range (which
+// would corrupt the SP-based exit lookup in notify_thread_exit).
+static void recycle_thread_arena(uint64_t stack_base, uint64_t guest_stack_addr, uint64_t tls_base) {
+    (void)guest_stack_addr;
+    std::lock_guard<std::mutex> lk(g_thread_arena_mutex);
+    if (stack_base != 0) {
+        uint64_t region = stack_base - QEMU_THREAD_STACK_SIZE + 0x100;
+        if (region >= QEMU_THREAD_STACK_BASE && region < QEMU_THREAD_STACK_CEILING) {
+            g_free_stack_region_bases.push_back(region);
+        }
+    }
+    if (tls_base != 0) {
+        uint64_t region = tls_base - 8;
+        if (region >= QEMU_THREAD_TLS_BASE && region < QEMU_THREAD_TLS_CEILING) {
+            g_free_tls_region_bases.push_back(region);
+        }
+    }
 }
 
 // Clone trampoline addresses
@@ -1562,7 +1729,7 @@ static constexpr uint64_t THREAD_DONE_HLE_ADDR = 0x10010000;  // HLE callback be
 static constexpr uint64_t SYS_THREAD_DONE = 0x1234;
 
 // Forward declaration for thread exit notification
-void notify_thread_exit(uint64_t tls_base, uint64_t retval);
+void notify_thread_exit(uint64_t thread_locator, uint64_t retval, bool finalize);
 
 // Store thread arguments on the child's stack:
 // [SP+0]: start_routine
@@ -1670,7 +1837,7 @@ void register_hle_pthread(HleManager& hle) {
                   << " retval=0x" << retval << std::dec << std::endl;
 
         // Notify that this thread is done
-        notify_thread_exit(tls_base, retval);
+        notify_thread_exit(tls_base, retval, false);
 
         // Return normally - the wrapper will then call exit()
         set_reg(emu, UC_ARM64_REG_X0, 0);
@@ -1836,7 +2003,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
         uint64_t tid = get_thread_id_from_sp(sp);
-        uint64_t visible_tid = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         int call_num = ++g_mutex_lock_count;
         auto start_time = std::chrono::steady_clock::now();
@@ -1902,7 +2069,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
         uint64_t tid = get_thread_id_from_sp(sp);
-        uint64_t visible_tid = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         if (mutex_addr == 0) {
             set_reg(emu, UC_ARM64_REG_X0, EINVAL);
@@ -1942,7 +2109,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
         uint64_t tid = get_thread_id_from_sp(sp);
-        uint64_t visible_tid = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         if (emu.is_debug()) {
             EMU_LOG << "[HLE:T" << std::hex << tid << "] pthread_mutex_unlock: mutex=0x"
@@ -2090,6 +2257,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
         uint64_t tid = get_thread_id_from_sp(sp);
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         int call_num = ++g_cond_wait_count;
         if (TRACE_PTHREAD_SYNC && (call_num <= 20 || call_num % 100 == 0)) {
@@ -2101,14 +2269,14 @@ void register_hle_pthread(HleManager& hle) {
         auto cv = get_or_create_condvar(cond_addr);
         auto mtx = get_or_create_mutex(mutex_addr);
 
-        // Wait on the condition variable (releases mutex, waits, reacquires)
-        cv->cv.wait(mtx->mtx);
+        int result = wait_cond_with_clock(*cv, *mtx, cv->clockid, nullptr, visible_tid);
 
         if (TRACE_PTHREAD_SYNC && (call_num <= 20 || call_num % 100 == 0)) {
-            EMU_LOG << "[SYNC-TRACE] cond_wait EXIT #" << call_num << std::endl;
+            EMU_LOG << "[SYNC-TRACE] cond_wait EXIT #" << call_num
+                    << " result=" << result << std::endl;
         }
 
-        set_reg(emu, UC_ARM64_REG_X0, 0);
+        set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
     hle.register_function("pthread_cond_timedwait", [](Emulator& emu) {
@@ -2117,6 +2285,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t abstime_ptr = get_reg(emu, UC_ARM64_REG_X2);
         uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
         uint64_t tid = get_thread_id_from_sp(sp);
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         // Read timespec from guest memory
         struct timespec ts;
@@ -2131,7 +2300,7 @@ void register_hle_pthread(HleManager& hle) {
         auto cv = get_or_create_condvar(cond_addr);
         auto mtx = get_or_create_mutex(mutex_addr);
 
-        set_reg(emu, UC_ARM64_REG_X0, wait_cond_with_clock(*cv, *mtx, cv->clockid, &ts));
+        set_reg(emu, UC_ARM64_REG_X0, wait_cond_with_clock(*cv, *mtx, cv->clockid, &ts, visible_tid));
     });
 
     hle.register_function("pthread_cond_signal", [](Emulator& emu) {
@@ -2411,6 +2580,8 @@ void register_hle_pthread(HleManager& hle) {
         if (tls_base == 0) {
             if (requested_stackaddr == 0) {
                 hle_release_vmas(child_stack_top);
+                // Return the arena stack we just took so it isn't leaked on this failure.
+                recycle_thread_arena(child_stack_top, 0, 0);
             }
             set_reg(emu, UC_ARM64_REG_X0, EAGAIN);
             return;
@@ -2573,10 +2744,17 @@ void register_hle_pthread(HleManager& hle) {
             emu.mem_write(retval_ptr, &retval, sizeof(retval));
         }
 
-        // Remove from registry
+        // Remove from registry and reclaim its arena regions for the next pthread_create.
         {
             std::lock_guard<std::mutex> lock(g_threads_mutex);
-            g_threads.erase(thread_id);
+            auto jit = g_threads.find(thread_id);
+            if (jit != g_threads.end()) {
+                uint64_t sb = jit->second->stack_base;
+                uint64_t gsa = jit->second->guest_stack_addr;
+                uint64_t tb = jit->second->tls_base;
+                g_threads.erase(jit);
+                recycle_thread_arena(sb, gsa, tb);
+            }
         }
 
         EMU_LOG << "[HLE] pthread_join: Thread " << thread_id
@@ -2607,7 +2785,12 @@ void register_hle_pthread(HleManager& hle) {
 
         it->second->detached = true;
         if (it->second->completed.load()) {
+            // Already finished: detaching reclaims it now (no future join will run).
+            uint64_t sb = it->second->stack_base;
+            uint64_t gsa = it->second->guest_stack_addr;
+            uint64_t tb = it->second->tls_base;
             g_threads.erase(it);
+            recycle_thread_arena(sb, gsa, tb);
         }
 
         set_reg(emu, UC_ARM64_REG_X0, 0);  // Success
@@ -3010,7 +3193,7 @@ void register_hle_pthread(HleManager& hle) {
 
     hle.register_function("pthread_spin_lock", [](Emulator& emu) {
         uint64_t lock = get_reg(emu, UC_ARM64_REG_X0);
-        uint64_t owner = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t owner = get_current_sync_thread_id(emu);
         auto spin = get_or_create_spinlock(lock);
         for (;;) {
             bool expected = false;
@@ -3027,7 +3210,7 @@ void register_hle_pthread(HleManager& hle) {
 
     hle.register_function("pthread_spin_trylock", [](Emulator& emu) {
         uint64_t lock = get_reg(emu, UC_ARM64_REG_X0);
-        uint64_t owner = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t owner = get_current_sync_thread_id(emu);
         auto spin = get_or_create_spinlock(lock);
         bool expected = false;
         bool success = spin->locked.compare_exchange_strong(expected, true,
@@ -3479,7 +3662,7 @@ void register_hle_pthread(HleManager& hle) {
     hle.register_function("pthread_mutex_timedlock", [](Emulator& emu) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t abstime_addr = get_reg(emu, UC_ARM64_REG_X1);
-        uint64_t visible_tid = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         auto m = get_or_create_mutex(mutex_addr);
         if (!m) {
@@ -3506,7 +3689,7 @@ void register_hle_pthread(HleManager& hle) {
     hle.register_function("pthread_mutex_timedlock_monotonic_np", [](Emulator& emu) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t abstime_addr = get_reg(emu, UC_ARM64_REG_X1);
-        uint64_t visible_tid = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         auto m = get_or_create_mutex(mutex_addr);
         if (!m) {
@@ -3533,7 +3716,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X0);
         int clockid = static_cast<int>(get_reg(emu, UC_ARM64_REG_X1));
         uint64_t abstime_addr = get_reg(emu, UC_ARM64_REG_X2);
-        uint64_t visible_tid = static_cast<uint64_t>(hle_get_current_visible_tid(emu));
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         auto m = get_or_create_mutex(mutex_addr);
         if (!m) {
@@ -3561,6 +3744,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t cond_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t abstime_addr = get_reg(emu, UC_ARM64_REG_X2);
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         auto c = get_or_create_condvar(cond_addr);
         auto m = get_or_create_mutex(mutex_addr);
@@ -3572,7 +3756,7 @@ void register_hle_pthread(HleManager& hle) {
 
         struct timespec ts{};
         const struct timespec* ts_ptr = read_guest_absolute_timespec(emu, abstime_addr, ts) ? &ts : nullptr;
-        set_reg(emu, UC_ARM64_REG_X0, wait_cond_with_clock(*c, *m, CLOCK_MONOTONIC, ts_ptr));
+        set_reg(emu, UC_ARM64_REG_X0, wait_cond_with_clock(*c, *m, CLOCK_MONOTONIC, ts_ptr, visible_tid));
     });
 
     // pthread_cond_clockwait - timedwait with specified clock
@@ -3581,6 +3765,7 @@ void register_hle_pthread(HleManager& hle) {
         uint64_t mutex_addr = get_reg(emu, UC_ARM64_REG_X1);
         int clockid = get_reg(emu, UC_ARM64_REG_X2);
         uint64_t abstime_addr = get_reg(emu, UC_ARM64_REG_X3);
+        uint64_t visible_tid = get_current_sync_thread_id(emu);
 
         auto c = get_or_create_condvar(cond_addr);
         auto m = get_or_create_mutex(mutex_addr);
@@ -3592,7 +3777,7 @@ void register_hle_pthread(HleManager& hle) {
 
         struct timespec ts{};
         const struct timespec* ts_ptr = read_guest_absolute_timespec(emu, abstime_addr, ts) ? &ts : nullptr;
-        set_reg(emu, UC_ARM64_REG_X0, wait_cond_with_clock(*c, *m, clockid, ts_ptr));
+        set_reg(emu, UC_ARM64_REG_X0, wait_cond_with_clock(*c, *m, clockid, ts_ptr, visible_tid));
     });
 
     // pthread_rwlock_timedrdlock
@@ -3718,7 +3903,7 @@ void register_hle_pthread(HleManager& hle) {
 // Notify that a thread has exited
 // This is called from the syscall handler when SYS_THREAD_DONE is invoked
 // We use the stack pointer (SP) to identify which thread - SP is within the thread's stack range
-void notify_thread_exit(uint64_t sp, uint64_t retval) {
+void notify_thread_exit(uint64_t sp, uint64_t retval, bool finalize) {
     std::lock_guard<std::mutex> lock(g_threads_mutex);
 
     // Find the thread by checking if SP falls within the thread's stack range
@@ -3732,31 +3917,49 @@ void notify_thread_exit(uint64_t sp, uint64_t retval) {
         uint64_t stack_top = thread->stack_base + 0x100;  // Include some margin
 
         if (sp >= stack_bottom && sp <= stack_top) {
-            if (thread->completed.load(std::memory_order_acquire)) {
-                EMU_LOG << "[HLE] Thread " << id << " exit already recorded, keeping retval=0x"
+            if (!thread->exit_reported.exchange(true, std::memory_order_acq_rel)) {
+                thread->return_value = retval;
+                EMU_LOG << "[HLE] Thread " << id << " reported exit (SP=0x" << std::hex << sp
+                          << ") with retval=0x" << retval << std::dec << std::endl;
+            } else if (thread->return_value != retval) {
+                EMU_LOG << "[HLE] Thread " << id << " exit already reported, keeping retval=0x"
                           << std::hex << thread->return_value << " (new retval=0x" << retval
                           << ")" << std::dec << std::endl;
+            }
+
+            if (!finalize) {
+                return;
+            }
+
+            if (thread->completed.exchange(true, std::memory_order_acq_rel)) {
+                EMU_LOG << "[HLE] Thread " << id << " exit already finalized (SP=0x"
+                          << std::hex << sp << ")" << std::dec << std::endl;
                 thread->join_cv.notify_all();
                 return;
             }
 
-            EMU_LOG << "[HLE] Thread " << id << " exiting (SP=0x" << std::hex << sp
-                      << ") with retval=0x" << retval << std::dec << std::endl;
+            EMU_LOG << "[HLE] Thread " << id << " finalizing exit (SP=0x" << std::hex << sp
+                      << ") with retval=0x" << thread->return_value << std::dec << std::endl;
 
-            thread->return_value = retval;
-            thread->completed.store(true);
             thread->join_cv.notify_all();
             hle_release_vmas(thread->stack_base);
             hle_release_vmas(thread->tls_base);
             if (thread->detached) {
+                // Detached + finished: nobody will join, so reclaim its arena regions.
+                // Capture before erase; push to freelists only AFTER the entry is gone.
+                uint64_t sb = thread->stack_base;
+                uint64_t gsa = thread->guest_stack_addr;
+                uint64_t tb = thread->tls_base;
                 g_threads.erase(it);
+                recycle_thread_arena(sb, gsa, tb);
             }
             return;
         }
     }
 
     // Thread not found in our registry - this might be the main thread
-    EMU_LOG << "[HLE] Unknown thread exiting (SP=0x" << std::hex << sp
+    EMU_LOG << "[HLE] Unknown thread " << (finalize ? "finalizing exit" : "reporting exit")
+              << " (SP=0x" << std::hex << sp
               << ") with retval=0x" << retval << std::dec << std::endl;
 }
 
