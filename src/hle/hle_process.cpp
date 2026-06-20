@@ -1423,6 +1423,8 @@ void register_hle_process(HleManager& hle) {
 
     // putenv - change or add environment variable
     hle.register_function("putenv", [](Emulator& emu) {
+        // Locks g_env/g_putenv AND the static env_strings vector below.
+        std::lock_guard<std::mutex> _el(g_env_mutex);
         uint64_t string_ptr = get_reg(emu, UC_ARM64_REG_X0);
         if (!string_ptr) {
             hle_set_errno(emu, EINVAL);
@@ -1448,6 +1450,7 @@ void register_hle_process(HleManager& hle) {
 
     // clearenv - clear environment
     hle.register_function("clearenv", [](Emulator& emu) {
+        std::lock_guard<std::mutex> _el(g_env_mutex);
         int result = ::clearenv();
         if (result == 0) {
             g_env.clear();

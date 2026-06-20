@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 #include <iostream>
@@ -41,6 +42,10 @@ static std::string read_string(Emulator& emu, uint64_t addr, size_t max_len = 40
 // File handle management (shared with hle_file.cpp)
 extern std::unordered_map<uint64_t, FILE*> g_file_map;
 extern int g_next_fd;
+// Guards the FILE*/fd table family (defined in hle_file.cpp). Any handler here that
+// touches g_file_map must hold this, since file handlers run concurrently across guest
+// threads with no other serialization.
+extern std::recursive_mutex g_file_tables_mutex;
 
 // ARM64 va_list structure
 // See: https://developer.arm.com/documentation/ihi0055/latest/
@@ -943,6 +948,7 @@ void register_hle_io(HleManager& hle) {
     });
 
     hle.register_function("fscanf", [](Emulator& emu) {
+        std::lock_guard<std::recursive_mutex> _fl(g_file_tables_mutex);
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t fmt_addr = get_reg(emu, UC_ARM64_REG_X1);
 

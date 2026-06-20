@@ -17,6 +17,7 @@
 #include "emu_compat.h"
 #include "thread_manager.h"
 #include <algorithm>
+#include <mutex>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,17 @@ using namespace bionic;
 // File descriptor mapping for emulated files (shared with hle_io.cpp)
 std::unordered_map<uint64_t, FILE*> g_file_map;
 int g_next_fd = 100;
+
+// Single recursive lock guarding the WHOLE FILE*/fd table family in this file plus the
+// g_file_map/g_next_fd shared with hle_io.cpp. HLE handlers run concurrently on multiple
+// guest (MTTCG) threads with NO global serialization (see emulator.cpp pre_syscall_hook
+// "each handler must be internally thread-safe"), so without this, concurrent
+// fopen/fclose/fread from different camera sessions race on these unordered_maps -> torn
+// buckets / use-after-free / double-free -> heap corruption. Recursive so memstream and
+// funopen cookie callbacks, which re-enter file handlers on the SAME thread, don't
+// self-deadlock. Held only across file ops (not the hot video path), so contention is
+// negligible. Defined here, referenced via extern from hle_io.cpp.
+std::recursive_mutex g_file_tables_mutex;
 static std::unordered_set<uint64_t> g_popen_handles;
 static std::unordered_map<uint64_t, pid_t> g_popen_pids;
 static std::unordered_set<uint64_t> g_closed_builtin_streams;
@@ -790,8 +802,20 @@ static int translate_open_flags(int guest_flags) {
 }
 
 void register_hle_file(HleManager& hle) {
+    // Every file handler below runs under g_file_tables_mutex for its whole body so the
+    // fd/FILE* tables cannot be corrupted by concurrent guest threads. The lock is
+    // recursive, so handlers that re-enter (memstream / funopen cookie callbacks on the
+    // same thread) are safe. Registrations go through reg_locked instead of
+    // hle.register_function directly.
+    auto reg_locked = [&hle](const char* name, auto fn) {
+        hle.register_function(name, [fn](Emulator& emu) {
+            std::lock_guard<std::recursive_mutex> _fl(g_file_tables_mutex);
+            fn(emu);
+        });
+    };
+
     // open
-    hle.register_function("open", [](Emulator& emu) {
+    reg_locked("open", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         int flags = get_reg(emu, UC_ARM64_REG_X1);
         int mode = get_reg(emu, UC_ARM64_REG_X2);
@@ -840,7 +864,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // close
-    hle.register_function("close", [](Emulator& emu) {
+    reg_locked("close", [](Emulator& emu) {
         int fd = (int)get_reg(emu, UC_ARM64_REG_X0);
         int result = ::close(fd);
         if (emu.is_debug()) {
@@ -853,7 +877,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // read
-    hle.register_function("read", [](Emulator& emu) {
+    reg_locked("read", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -862,19 +886,17 @@ void register_hle_file(HleManager& hle) {
             EMU_LOG << "[HLE] read: fd=" << fd << " count=" << count << std::endl;
         }
 
-        std::vector<char> buf(count);
-
-        // Direct blocking read - with MTTCG, this blocks only this host thread
         errno = 0;
-        ssize_t result = ::read(fd, buf.data(), count);
+        ssize_t result = emu.threads().blocking_read(fd, buf_addr, count);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
         if (emu.is_debug()) {
             EMU_LOG << "[HLE] read: result=" << result << std::endl;
         }
 
-        if (result > 0) {
-            emu.mem_write(buf_addr, buf.data(), result);
-        } else if (result < 0) {
+        if (result < 0) {
             hle_set_errno(emu, errno);
         }
 
@@ -882,7 +904,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // write
-    hle.register_function("write", [](Emulator& emu) {
+    reg_locked("write", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -891,12 +913,11 @@ void register_hle_file(HleManager& hle) {
             EMU_LOG << "[HLE] write: fd=" << fd << " count=" << count << std::endl;
         }
 
-        std::vector<char> buf(count);
-        emu.mem_read(buf_addr, buf.data(), count);
-
-        // Direct blocking write - with MTTCG, this blocks only this host thread
         errno = 0;
-        ssize_t result = ::write(fd, buf.data(), count);
+        ssize_t result = emu.threads().blocking_write(fd, buf_addr, count);
+        if (result == CONTEXT_SWITCH_OCCURRED) {
+            return;
+        }
 
         if (result < 0) {
             hle_set_errno(emu, errno);
@@ -908,7 +929,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // eventfd
-    hle.register_function("eventfd", [](Emulator& emu) {
+    reg_locked("eventfd", [](Emulator& emu) {
         unsigned int initval = static_cast<unsigned int>(get_reg(emu, UC_ARM64_REG_X0));
         int flags = static_cast<int>(get_reg(emu, UC_ARM64_REG_X1));
 
@@ -919,7 +940,7 @@ void register_hle_file(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, static_cast<uint64_t>(fd));
     });
 
-    hle.register_function("eventfd_read", [](Emulator& emu) {
+    reg_locked("eventfd_read", [](Emulator& emu) {
         int fd = static_cast<int>(get_reg(emu, UC_ARM64_REG_X0));
         uint64_t value_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -933,7 +954,7 @@ void register_hle_file(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, static_cast<uint64_t>(result));
     });
 
-    hle.register_function("eventfd_write", [](Emulator& emu) {
+    reg_locked("eventfd_write", [](Emulator& emu) {
         int fd = static_cast<int>(get_reg(emu, UC_ARM64_REG_X0));
         eventfd_t value = static_cast<eventfd_t>(get_reg(emu, UC_ARM64_REG_X1));
 
@@ -945,7 +966,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // lseek
-    hle.register_function("lseek", [](Emulator& emu) {
+    reg_locked("lseek", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t offset = get_reg(emu, UC_ARM64_REG_X1);
         int whence = get_reg(emu, UC_ARM64_REG_X2);
@@ -955,7 +976,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fopen
-    hle.register_function("fopen", [](Emulator& emu) {
+    reg_locked("fopen", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t mode_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -985,7 +1006,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fclose
-    hle.register_function("fclose", [](Emulator& emu) {
+    reg_locked("fclose", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         auto it = g_file_map.find(stream);
         if (it != g_file_map.end()) {
@@ -1078,7 +1099,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fread
-    hle.register_function("fread", [](Emulator& emu) {
+    reg_locked("fread", [](Emulator& emu) {
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X0);
         size_t size = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -1135,7 +1156,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fgets
-    hle.register_function("fgets", [](Emulator& emu) {
+    reg_locked("fgets", [](Emulator& emu) {
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X0);
         int size = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X2);
@@ -1161,7 +1182,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // setbuf
-    hle.register_function("setbuf", [](Emulator& emu) {
+    reg_locked("setbuf", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t guest_buf = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1176,7 +1197,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // setvbuf
-    hle.register_function("setvbuf", [](Emulator& emu) {
+    reg_locked("setvbuf", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t guest_buf = get_reg(emu, UC_ARM64_REG_X1);
         int mode = get_reg(emu, UC_ARM64_REG_X2);
@@ -1198,7 +1219,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // remove
-    hle.register_function("remove", [](Emulator& emu) {
+    reg_locked("remove", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
         std::string host_path = guest_path_to_host(path);
@@ -1211,7 +1232,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fwrite
-    hle.register_function("fwrite", [](Emulator& emu) {
+    reg_locked("fwrite", [](Emulator& emu) {
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X0);
         size_t size = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -1258,7 +1279,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fseek
-    hle.register_function("fseek", [](Emulator& emu) {
+    reg_locked("fseek", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         long offset = get_reg(emu, UC_ARM64_REG_X1);
         int whence = get_reg(emu, UC_ARM64_REG_X2);
@@ -1293,7 +1314,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // ftell
-    hle.register_function("ftell", [](Emulator& emu) {
+    reg_locked("ftell", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
 
         auto funopen_it = g_funopen_streams.find(stream);
@@ -1322,7 +1343,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fflush
-    hle.register_function("fflush", [](Emulator& emu) {
+    reg_locked("fflush", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
 
         if (stream == 0) {
@@ -1359,7 +1380,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // stat - uses ARM64 bionic stat structure (128 bytes)
-    hle.register_function("stat", [](Emulator& emu) {
+    reg_locked("stat", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1387,7 +1408,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fstat - get file status from file descriptor
-    hle.register_function("fstat", [](Emulator& emu) {
+    reg_locked("fstat", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1407,7 +1428,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // lstat - get file status (doesn't follow symlinks)
-    hle.register_function("lstat", [](Emulator& emu) {
+    reg_locked("lstat", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1429,7 +1450,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fcntl
-    hle.register_function("fcntl", [](Emulator& emu) {
+    reg_locked("fcntl", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         int cmd = get_reg(emu, UC_ARM64_REG_X1);
         int arg = get_reg(emu, UC_ARM64_REG_X2);
@@ -1445,7 +1466,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // ioctl - with proper network interface support
-    hle.register_function("ioctl", [](Emulator& emu) {
+    reg_locked("ioctl", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         unsigned long request = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t arg_ptr = get_reg(emu, UC_ARM64_REG_X2);
@@ -1543,7 +1564,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fdopen
-    hle.register_function("fdopen", [](Emulator& emu) {
+    reg_locked("fdopen", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t mode_addr = get_reg(emu, UC_ARM64_REG_X1);
         std::string mode = read_string(emu, mode_addr);
@@ -1574,7 +1595,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // access
-    hle.register_function("access", [](Emulator& emu) {
+    reg_locked("access", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         int mode = get_reg(emu, UC_ARM64_REG_X1);
         
@@ -1588,7 +1609,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // unlink
-    hle.register_function("unlink", [](Emulator& emu) {
+    reg_locked("unlink", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
         std::string host_path = guest_path_to_host(path);
@@ -1597,7 +1618,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // rename
-    hle.register_function("rename", [](Emulator& emu) {
+    reg_locked("rename", [](Emulator& emu) {
         uint64_t old_path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t new_path_addr = get_reg(emu, UC_ARM64_REG_X1);
         
@@ -1610,7 +1631,7 @@ void register_hle_file(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("renameat", [](Emulator& emu) {
+    reg_locked("renameat", [](Emulator& emu) {
         int old_dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t old_path_addr = get_reg(emu, UC_ARM64_REG_X1);
         int new_dirfd = get_reg(emu, UC_ARM64_REG_X2);
@@ -1629,7 +1650,7 @@ void register_hle_file(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("renameat2", [](Emulator& emu) {
+    reg_locked("renameat2", [](Emulator& emu) {
         int old_dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t old_path_addr = get_reg(emu, UC_ARM64_REG_X1);
         int new_dirfd = get_reg(emu, UC_ARM64_REG_X2);
@@ -1651,7 +1672,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // mkdir
-    hle.register_function("mkdir", [](Emulator& emu) {
+    reg_locked("mkdir", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         int mode = get_reg(emu, UC_ARM64_REG_X1);
         
@@ -1662,7 +1683,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // rmdir
-    hle.register_function("rmdir", [](Emulator& emu) {
+    reg_locked("rmdir", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
         std::string host_path = guest_path_to_host(path);
@@ -1671,14 +1692,14 @@ void register_hle_file(HleManager& hle) {
     });
     
     // dup
-    hle.register_function("dup", [](Emulator& emu) {
+    reg_locked("dup", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         int result = ::dup(fd);
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
     
     // dup2
-    hle.register_function("dup2", [](Emulator& emu) {
+    reg_locked("dup2", [](Emulator& emu) {
         int oldfd = get_reg(emu, UC_ARM64_REG_X0);
         int newfd = get_reg(emu, UC_ARM64_REG_X1);
         errno = 0;
@@ -1690,7 +1711,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // pipe
-    hle.register_function("pipe", [](Emulator& emu) {
+    reg_locked("pipe", [](Emulator& emu) {
         uint64_t pipefd_addr = get_reg(emu, UC_ARM64_REG_X0);
         int pipefd[2];
         int result = ::pipe(pipefd);
@@ -1704,7 +1725,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // fileno - return the fd for a FILE*
-    hle.register_function("fileno", [](Emulator& emu) {
+    reg_locked("fileno", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         int result = hle_resolve_guest_fileno(emu, stream);
         if (result != -1) {
@@ -1716,7 +1737,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // feof
-    hle.register_function("feof", [](Emulator& emu) {
+    reg_locked("feof", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         FILE* fp = hle_resolve_guest_file(emu, stream);
         if (fp != nullptr) {
@@ -1729,7 +1750,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // ferror
-    hle.register_function("ferror", [](Emulator& emu) {
+    reg_locked("ferror", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         FILE* fp = hle_resolve_guest_file(emu, stream);
         if (fp != nullptr) {
@@ -1742,7 +1763,7 @@ void register_hle_file(HleManager& hle) {
     });
     
     // clearerr
-    hle.register_function("clearerr", [](Emulator& emu) {
+    reg_locked("clearerr", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         FILE* fp = hle_resolve_guest_file(emu, stream);
         if (fp != nullptr) {
@@ -1751,7 +1772,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // rewind
-    hle.register_function("rewind", [](Emulator& emu) {
+    reg_locked("rewind", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         FILE* fp = hle_resolve_guest_file(emu, stream);
         if (fp != nullptr) {
@@ -1761,7 +1782,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fgetc
-    hle.register_function("fgetc", [](Emulator& emu) {
+    reg_locked("fgetc", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         FILE* fp = hle_resolve_guest_file(emu, stream);
         if (fp != nullptr) {
@@ -1775,7 +1796,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // getc (same as fgetc)
-    hle.register_function("getc", [](Emulator& emu) {
+    reg_locked("getc", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         FILE* fp = hle_resolve_guest_file(emu, stream);
         if (fp != nullptr) {
@@ -1789,7 +1810,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // ungetc
-    hle.register_function("ungetc", [](Emulator& emu) {
+    reg_locked("ungetc", [](Emulator& emu) {
         int c = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X1);
         FILE* fp = hle_resolve_guest_file(emu, stream);
@@ -1804,7 +1825,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fputc
-    hle.register_function("fputc", [](Emulator& emu) {
+    reg_locked("fputc", [](Emulator& emu) {
         int c = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X1);
         FILE* fp = hle_resolve_guest_file(emu, stream);
@@ -1829,7 +1850,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // putc (same as fputc)
-    hle.register_function("putc", [](Emulator& emu) {
+    reg_locked("putc", [](Emulator& emu) {
         int c = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X1);
         FILE* fp = hle_resolve_guest_file(emu, stream);
@@ -1849,7 +1870,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fputs (for files, not just stdout)
-    hle.register_function("fputs", [](Emulator& emu) {
+    reg_locked("fputs", [](Emulator& emu) {
         uint64_t s_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X1);
         std::string str = read_string(emu, s_addr);
@@ -1875,7 +1896,7 @@ void register_hle_file(HleManager& hle) {
     // ========================================================================
 
     // open64 - same as open on 64-bit systems
-    hle.register_function("open64", [](Emulator& emu) {
+    reg_locked("open64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         int flags = get_reg(emu, UC_ARM64_REG_X1);
         int mode = get_reg(emu, UC_ARM64_REG_X2);
@@ -1895,7 +1916,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fseeko - 64-bit offset fseek
-    hle.register_function("fseeko", [](Emulator& emu) {
+    reg_locked("fseeko", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         int64_t offset = get_reg(emu, UC_ARM64_REG_X1);
         int whence = get_reg(emu, UC_ARM64_REG_X2);
@@ -1928,7 +1949,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fseeko64 - same as fseeko on 64-bit systems
-    hle.register_function("fseeko64", [](Emulator& emu) {
+    reg_locked("fseeko64", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         int64_t offset = get_reg(emu, UC_ARM64_REG_X1);
         int whence = get_reg(emu, UC_ARM64_REG_X2);
@@ -1961,7 +1982,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // ftello - 64-bit offset ftell
-    hle.register_function("ftello", [](Emulator& emu) {
+    reg_locked("ftello", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
 
         auto funopen_it = g_funopen_streams.find(stream);
@@ -1990,7 +2011,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // ftello64 - same as ftello on 64-bit systems
-    hle.register_function("ftello64", [](Emulator& emu) {
+    reg_locked("ftello64", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
 
         auto funopen_it = g_funopen_streams.find(stream);
@@ -2019,7 +2040,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // lseek64 - 64-bit lseek
-    hle.register_function("lseek64", [](Emulator& emu) {
+    reg_locked("lseek64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         int64_t offset = get_reg(emu, UC_ARM64_REG_X1);
         int whence = get_reg(emu, UC_ARM64_REG_X2);
@@ -2029,7 +2050,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // tmpfile - create a temporary file
-    hle.register_function("tmpfile", [](Emulator& emu) {
+    reg_locked("tmpfile", [](Emulator& emu) {
         FILE* fp = create_guest_tmpfile(emu);
         if (fp) {
             uint64_t fd = g_next_fd++;
@@ -2047,7 +2068,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // tmpfile64 - same as tmpfile on 64-bit systems
-    hle.register_function("tmpfile64", [](Emulator& emu) {
+    reg_locked("tmpfile64", [](Emulator& emu) {
         FILE* fp = create_guest_tmpfile(emu);
         if (fp) {
             uint64_t fd = g_next_fd++;
@@ -2059,7 +2080,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // mkstemp - create a unique temporary file
-    hle.register_function("mkstemp", [](Emulator& emu) {
+    reg_locked("mkstemp", [](Emulator& emu) {
         uint64_t template_addr = get_reg(emu, UC_ARM64_REG_X0);
 
         // Read the template
@@ -2082,7 +2103,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // mkstemp64 - same as mkstemp on 64-bit systems
-    hle.register_function("mkstemp64", [](Emulator& emu) {
+    reg_locked("mkstemp64", [](Emulator& emu) {
         uint64_t template_addr = get_reg(emu, UC_ARM64_REG_X0);
 
         std::string templ = read_string(emu, template_addr);
@@ -2100,7 +2121,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // mkostemp - mkstemp with flags
-    hle.register_function("mkostemp", [](Emulator& emu) {
+    reg_locked("mkostemp", [](Emulator& emu) {
         uint64_t template_addr = get_reg(emu, UC_ARM64_REG_X0);
         int flags = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2119,7 +2140,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // mkostemp64 - same as mkostemp on 64-bit systems
-    hle.register_function("mkostemp64", [](Emulator& emu) {
+    reg_locked("mkostemp64", [](Emulator& emu) {
         uint64_t template_addr = get_reg(emu, UC_ARM64_REG_X0);
         int flags = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2138,7 +2159,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // mkdtemp - create a unique temporary directory
-    hle.register_function("mkdtemp", [](Emulator& emu) {
+    reg_locked("mkdtemp", [](Emulator& emu) {
         uint64_t template_addr = get_reg(emu, UC_ARM64_REG_X0);
 
         std::string templ = read_string(emu, template_addr);
@@ -2157,7 +2178,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fdatasync - synchronize file data to disk
-    hle.register_function("fdatasync", [](Emulator& emu) {
+    reg_locked("fdatasync", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         errno = 0;
         int result = ::fdatasync(fd);
@@ -2168,7 +2189,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fsync - synchronize file data and metadata to disk
-    hle.register_function("fsync", [](Emulator& emu) {
+    reg_locked("fsync", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         errno = 0;
         int result = ::fsync(fd);
@@ -2179,7 +2200,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // ftruncate - truncate a file to a specified length
-    hle.register_function("ftruncate", [](Emulator& emu) {
+    reg_locked("ftruncate", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t length = get_reg(emu, UC_ARM64_REG_X1);
         errno = 0;
@@ -2191,7 +2212,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // ftruncate64 - same as ftruncate on 64-bit systems
-    hle.register_function("ftruncate64", [](Emulator& emu) {
+    reg_locked("ftruncate64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t length = get_reg(emu, UC_ARM64_REG_X1);
         errno = 0;
@@ -2203,7 +2224,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // truncate - truncate a file to a specified length (by path)
-    hle.register_function("truncate", [](Emulator& emu) {
+    reg_locked("truncate", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         off_t length = get_reg(emu, UC_ARM64_REG_X1);
         std::string path = read_string(emu, path_addr);
@@ -2216,7 +2237,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // truncate64 - same as truncate on 64-bit systems
-    hle.register_function("truncate64", [](Emulator& emu) {
+    reg_locked("truncate64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         off_t length = get_reg(emu, UC_ARM64_REG_X1);
         std::string path = read_string(emu, path_addr);
@@ -2229,7 +2250,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // pread - read from file at offset
-    hle.register_function("pread", [](Emulator& emu) {
+    reg_locked("pread", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -2246,7 +2267,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // pread64 - same as pread on 64-bit systems
-    hle.register_function("pread64", [](Emulator& emu) {
+    reg_locked("pread64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -2263,7 +2284,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // pwrite - write to file at offset
-    hle.register_function("pwrite", [](Emulator& emu) {
+    reg_locked("pwrite", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -2277,7 +2298,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // pwrite64 - same as pwrite on 64-bit systems
-    hle.register_function("pwrite64", [](Emulator& emu) {
+    reg_locked("pwrite64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -2291,7 +2312,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // stat64 - same as stat on 64-bit systems
-    hle.register_function("stat64", [](Emulator& emu) {
+    reg_locked("stat64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2312,7 +2333,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fstat64 - same as fstat on 64-bit systems
-    hle.register_function("fstat64", [](Emulator& emu) {
+    reg_locked("fstat64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2331,7 +2352,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // lstat64 - same as lstat on 64-bit systems
-    hle.register_function("lstat64", [](Emulator& emu) {
+    reg_locked("lstat64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2356,7 +2377,7 @@ void register_hle_file(HleManager& hle) {
     // ========================================================================
 
     // openat - open file relative to directory fd
-    hle.register_function("openat", [](Emulator& emu) {
+    reg_locked("openat", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X1);
         int flags = get_reg(emu, UC_ARM64_REG_X2);
@@ -2372,7 +2393,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // openat64 - same as openat on 64-bit systems
-    hle.register_function("openat64", [](Emulator& emu) {
+    reg_locked("openat64", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X1);
         int flags = get_reg(emu, UC_ARM64_REG_X2);
@@ -2388,7 +2409,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // creat - create a file
-    hle.register_function("creat", [](Emulator& emu) {
+    reg_locked("creat", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         mode_t mode = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2402,7 +2423,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // creat64 - same as creat on 64-bit systems
-    hle.register_function("creat64", [](Emulator& emu) {
+    reg_locked("creat64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         mode_t mode = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2420,7 +2441,7 @@ void register_hle_file(HleManager& hle) {
     // ========================================================================
 
     // posix_fadvise - provide advice on file access patterns
-    hle.register_function("posix_fadvise", [](Emulator& emu) {
+    reg_locked("posix_fadvise", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t offset = get_reg(emu, UC_ARM64_REG_X1);
         off_t len = get_reg(emu, UC_ARM64_REG_X2);
@@ -2431,7 +2452,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // posix_fadvise64 - same as posix_fadvise on 64-bit systems
-    hle.register_function("posix_fadvise64", [](Emulator& emu) {
+    reg_locked("posix_fadvise64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t offset = get_reg(emu, UC_ARM64_REG_X1);
         off_t len = get_reg(emu, UC_ARM64_REG_X2);
@@ -2442,7 +2463,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fallocate - manipulate file space
-    hle.register_function("fallocate", [](Emulator& emu) {
+    reg_locked("fallocate", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         int mode = get_reg(emu, UC_ARM64_REG_X1);
         off_t offset = get_reg(emu, UC_ARM64_REG_X2);
@@ -2456,7 +2477,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fallocate64 - same as fallocate on 64-bit systems
-    hle.register_function("fallocate64", [](Emulator& emu) {
+    reg_locked("fallocate64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         int mode = get_reg(emu, UC_ARM64_REG_X1);
         off_t offset = get_reg(emu, UC_ARM64_REG_X2);
@@ -2470,7 +2491,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // posix_fallocate - allocate file space
-    hle.register_function("posix_fallocate", [](Emulator& emu) {
+    reg_locked("posix_fallocate", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t offset = get_reg(emu, UC_ARM64_REG_X1);
         off_t len = get_reg(emu, UC_ARM64_REG_X2);
@@ -2480,7 +2501,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // posix_fallocate64 - same as posix_fallocate on 64-bit systems
-    hle.register_function("posix_fallocate64", [](Emulator& emu) {
+    reg_locked("posix_fallocate64", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off_t offset = get_reg(emu, UC_ARM64_REG_X1);
         off_t len = get_reg(emu, UC_ARM64_REG_X2);
@@ -2490,7 +2511,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fstatat - stat relative to directory fd
-    hle.register_function("fstatat", [](Emulator& emu) {
+    reg_locked("fstatat", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X2);
@@ -2511,7 +2532,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fstatat64 - same as fstatat on 64-bit systems
-    hle.register_function("fstatat64", [](Emulator& emu) {
+    reg_locked("fstatat64", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X2);
@@ -2563,7 +2584,7 @@ void register_hle_file(HleManager& hle) {
         uint64_t __spare3[12];
     };
 
-    hle.register_function("statx", [](Emulator& emu) {
+    reg_locked("statx", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X1);
         int flags = get_reg(emu, UC_ARM64_REG_X2);
@@ -2614,7 +2635,7 @@ void register_hle_file(HleManager& hle) {
     // popen/pclose - process I/O
     // ========================================================================
 
-    hle.register_function("popen", [](Emulator& emu) {
+    reg_locked("popen", [](Emulator& emu) {
         uint64_t command_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t type_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2703,7 +2724,7 @@ void register_hle_file(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, fd);
     });
 
-    hle.register_function("pclose", [](Emulator& emu) {
+    reg_locked("pclose", [](Emulator& emu) {
         uint64_t fp = get_reg(emu, UC_ARM64_REG_X0);
 
         auto it = g_file_map.find(fp);
@@ -2740,7 +2761,7 @@ void register_hle_file(HleManager& hle) {
     // fgetpos/fsetpos - file position functions
     // ========================================================================
 
-    hle.register_function("fgetpos", [](Emulator& emu) {
+    reg_locked("fgetpos", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t pos_ptr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2782,7 +2803,7 @@ void register_hle_file(HleManager& hle) {
         }
     });
 
-    hle.register_function("fsetpos", [](Emulator& emu) {
+    reg_locked("fsetpos", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t pos_ptr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -2827,7 +2848,7 @@ void register_hle_file(HleManager& hle) {
     // fmemopen - open memory as stream
     // ========================================================================
 
-    hle.register_function("fmemopen", [](Emulator& emu) {
+    reg_locked("fmemopen", [](Emulator& emu) {
         uint64_t buf_ptr = get_reg(emu, UC_ARM64_REG_X0);
         size_t size = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t mode_addr = get_reg(emu, UC_ARM64_REG_X2);
@@ -2880,7 +2901,7 @@ void register_hle_file(HleManager& hle) {
     // Splice functions
     // ========================================================================
 
-    hle.register_function("splice", [](Emulator& emu) {
+    reg_locked("splice", [](Emulator& emu) {
         int fd_in = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t off_in_ptr = get_reg(emu, UC_ARM64_REG_X1);
         int fd_out = get_reg(emu, UC_ARM64_REG_X2);
@@ -2907,7 +2928,7 @@ void register_hle_file(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(result)));
     });
 
-    hle.register_function("vmsplice", [](Emulator& emu) {
+    reg_locked("vmsplice", [](Emulator& emu) {
         struct guest_iovec {
             uint64_t iov_base;
             uint64_t iov_len;
@@ -2959,7 +2980,7 @@ void register_hle_file(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(result)));
     });
 
-    hle.register_function("tee", [](Emulator& emu) {
+    reg_locked("tee", [](Emulator& emu) {
         int fd_in = get_reg(emu, UC_ARM64_REG_X0);
         int fd_out = get_reg(emu, UC_ARM64_REG_X1);
         size_t len = get_reg(emu, UC_ARM64_REG_X2);
@@ -2973,7 +2994,7 @@ void register_hle_file(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(result)));
     });
 
-    hle.register_function("readahead", [](Emulator& emu) {
+    reg_locked("readahead", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off64_t offset = get_reg(emu, UC_ARM64_REG_X1);
         size_t count = get_reg(emu, UC_ARM64_REG_X2);
@@ -2986,7 +3007,7 @@ void register_hle_file(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(result)));
     });
 
-    hle.register_function("sync_file_range", [](Emulator& emu) {
+    reg_locked("sync_file_range", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         off64_t offset = get_reg(emu, UC_ARM64_REG_X1);
         off64_t nbytes = get_reg(emu, UC_ARM64_REG_X2);
@@ -3004,7 +3025,7 @@ void register_hle_file(HleManager& hle) {
     // ========================================================================
 
     // open_memstream - open a memory stream for writing
-    hle.register_function("open_memstream", [](Emulator& emu) {
+    reg_locked("open_memstream", [](Emulator& emu) {
         uint64_t ptr_ptr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t sizeloc_ptr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -3035,7 +3056,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // freopen - reopen a file stream
-    hle.register_function("freopen", [](Emulator& emu) {
+    reg_locked("freopen", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t mode_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X2);
@@ -3070,7 +3091,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fopen64 - same as fopen on 64-bit systems
-    hle.register_function("fopen64", [](Emulator& emu) {
+    reg_locked("fopen64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t mode_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -3090,7 +3111,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // freopen64 - same as freopen on 64-bit systems
-    hle.register_function("freopen64", [](Emulator& emu) {
+    reg_locked("freopen64", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t mode_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X2);
@@ -3125,7 +3146,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // funopen - open stream with custom callbacks (BSD extension)
-    hle.register_function("funopen", [](Emulator& emu) {
+    reg_locked("funopen", [](Emulator& emu) {
         uint64_t cookie = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t read_fn = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t write_fn = get_reg(emu, UC_ARM64_REG_X2);
@@ -3144,7 +3165,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // funopen64 - same as funopen
-    hle.register_function("funopen64", [](Emulator& emu) {
+    reg_locked("funopen64", [](Emulator& emu) {
         uint64_t cookie = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t read_fn = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t write_fn = get_reg(emu, UC_ARM64_REG_X2);
@@ -3163,7 +3184,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fgetpos64 - same as fgetpos on 64-bit systems
-    hle.register_function("fgetpos64", [](Emulator& emu) {
+    reg_locked("fgetpos64", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t pos_ptr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -3206,7 +3227,7 @@ void register_hle_file(HleManager& hle) {
     });
 
     // fsetpos64 - same as fsetpos on 64-bit systems
-    hle.register_function("fsetpos64", [](Emulator& emu) {
+    reg_locked("fsetpos64", [](Emulator& emu) {
         uint64_t stream = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t pos_ptr = get_reg(emu, UC_ARM64_REG_X1);
 

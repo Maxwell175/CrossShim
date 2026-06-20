@@ -43,6 +43,7 @@ std::unordered_map<std::string, std::string> g_env = {
     {"OPENSSL_CONF", "/etc/ssl/openssl.cnf"},
 };
 std::unordered_map<std::string, uint64_t> g_putenv_guest_strings;
+std::mutex g_env_mutex;
 
 // Random number generator (shared with other modules via extern if needed)
 static std::mt19937 g_rng(std::random_device{}());
@@ -127,6 +128,7 @@ void register_hle_stdlib(HleManager& hle) {
     // ========================================================================
 
     hle.register_function("getenv", [](Emulator& emu) {
+        std::lock_guard<std::mutex> _el(g_env_mutex);
         uint64_t name_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string name = read_string(emu, name_addr);
 
@@ -163,6 +165,7 @@ void register_hle_stdlib(HleManager& hle) {
     });
 
     hle.register_function("setenv", [](Emulator& emu) {
+        std::lock_guard<std::mutex> _el(g_env_mutex);
         uint64_t name_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t value_addr = get_reg(emu, UC_ARM64_REG_X1);
         int overwrite = get_reg(emu, UC_ARM64_REG_X2);
@@ -189,6 +192,7 @@ void register_hle_stdlib(HleManager& hle) {
     });
 
     hle.register_function("unsetenv", [](Emulator& emu) {
+        std::lock_guard<std::mutex> _el(g_env_mutex);
         uint64_t name_addr = get_reg(emu, UC_ARM64_REG_X0);
         if (name_addr == 0) {
             hle_set_errno(emu, EINVAL);
