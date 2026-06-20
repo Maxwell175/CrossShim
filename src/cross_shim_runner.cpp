@@ -21,6 +21,7 @@ static void print_usage(const char* prog) {
     std::cerr << std::endl;
     std::cerr << "Environment variables:" << std::endl;
     std::cerr << "  EMU_DEBUG=1       Enable debug output" << std::endl;
+    std::cerr << "  EMU_PROFILE=1     Enable periodic profiling output" << std::endl;
     std::cerr << "  EMU_TRACE=1       Enable instruction tracing" << std::endl;
     std::cerr << "  EMU_HEAP_MB=N     Set heap size in MB (default: 64)" << std::endl;
     std::cerr << "  EMU_STACK_MB=N    Set stack size in MB (default: 8)" << std::endl;
@@ -48,6 +49,9 @@ int main(int argc, char* argv[]) {
 
     if (const char* v = getenv("EMU_DEBUG")) {
         config.enable_debug = (atoi(v) != 0);
+    }
+    if (const char* v = getenv("EMU_PROFILE")) {
+        config.enable_profile = (atoi(v) != 0);
     }
     if (const char* v = getenv("EMU_TRACE")) {
         config.enable_tracing = (atoi(v) != 0);

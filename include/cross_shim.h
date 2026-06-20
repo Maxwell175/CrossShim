@@ -95,6 +95,7 @@ struct EmulatorConfig {
     bool enable_syscall_logging = false;
     bool enable_threading = true;  // Enable real host threading
     bool enable_debug = false;     // Enable debug output
+    bool enable_profile = false;   // Enable periodic profiling output
 };
 
 // Main emulator class
@@ -134,6 +135,7 @@ public:
     // Register access
     uint64_t get_reg(int reg) const;
     void set_reg(int reg, uint64_t value);
+    float get_sreg_value(int reg) const;
     
     // Memory access
     bool mem_read(uint64_t address, void* buffer, size_t size) const;
@@ -155,8 +157,10 @@ public:
     ThreadManager& threads() { return *threads_; }
     SyscallHandler& syscall() { return *syscall_; }
     const std::vector<LoadedModule>& modules() const { return modules_; }
-    void set_debug(bool enabled) { debug_enabled_ = enabled; }
+    void set_debug(bool enabled);
     bool is_debug() const { return debug_enabled_; }
+    void set_profile(bool enabled);
+    bool is_profile() const { return profile_enabled_; }
 
     // Mutex for serializing HLE handler calls from multiple threads
     // CRITICAL: Must be used by syscall hook when calling HLE handlers
@@ -224,6 +228,7 @@ private:
     // The old shared bool caused races when child threads finished their
     // start() call and set running_=false, terminating the main thread's loop
     bool debug_enabled_ = false;
+    bool profile_enabled_ = false;
 
     // Flag to indicate we need to restart after a context switch in HLE handler
     bool context_switch_restart_needed_ = false;
@@ -273,8 +278,14 @@ private:
     std::condition_variable request_cv_;
 
     void emulator_thread_func();  // Background thread function
+    // Exception firewall: catches any C++ exception escaping guest execution / HLE and
+    // converts it to a failed call (-1) instead of letting it cross the P/Invoke boundary
+    // or escape the worker thread (which would std::terminate the whole process and every
+    // camera). All call paths (worker thread, direct, safe) funnel through here.
     uint64_t call_function_internal(uint64_t address, const std::vector<uint64_t>& args, bool is_safe,
                                     uint64_t safe_stack_top = 0);
+    uint64_t call_function_internal_impl(uint64_t address, const std::vector<uint64_t>& args, bool is_safe,
+                                         uint64_t safe_stack_top = 0);
     void start_emulator_thread();  // Start background thread
     void stop_emulator_thread();   // Stop background thread
 
