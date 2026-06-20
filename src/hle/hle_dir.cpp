@@ -11,6 +11,7 @@
 #include "bionic_types.h"
 #include "emu_compat.h"
 #include <cstring>
+#include <mutex>
 #include <dirent.h>
 #include <fts.h>
 #include <ftw.h>
@@ -75,6 +76,14 @@ struct FtsSession {
     std::vector<std::unique_ptr<char[]>> roots;
 };
 static std::unordered_map<FTS*, FtsSession> g_fts_sessions;
+
+// Recursive lock guarding the directory tables above (g_dir_handles, g_next_dir_handle,
+// g_glob_guest_allocations, g_fts_sessions). HLE handlers run concurrently on MTTCG guest
+// threads with no global serialization, so concurrent opendir/readdir/closedir/glob/fts
+// across camera sessions would corrupt these maps. Recursive because scandir comparators
+// and ftw/nftw/glob callbacks re-enter dir handlers (via call_function_safe) on the same
+// thread. (The per-walk ftw/glob contexts are thread_local and need no locking.)
+static std::recursive_mutex g_dir_tables_mutex;
 
 struct ftw_arm64 {
     int32_t base;
@@ -775,11 +784,21 @@ static void write_guest_glob_result(Emulator& emu, uint64_t guest_glob_addr,
 }
 
 void register_hle_dir(HleManager& hle) {
+    // Every directory handler runs under g_dir_tables_mutex for its whole body so the
+    // directory tables can't be corrupted by concurrent guest threads. Recursive, so
+    // scandir/ftw/glob callbacks that re-enter dir handlers on the same thread are safe.
+    auto reg_locked = [&hle](const char* name, auto fn) {
+        hle.register_function(name, [fn](Emulator& emu) {
+            std::lock_guard<std::recursive_mutex> _dl(g_dir_tables_mutex);
+            fn(emu);
+        });
+    };
+
     // ========================================================================
     // Directory traversal
     // ========================================================================
-    
-    hle.register_function("opendir", [](Emulator& emu) {
+
+    reg_locked("opendir", [](Emulator& emu) {
         uint64_t name_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string name = read_string(emu, name_addr);
         std::string host_name = guest_path_to_host(name);
@@ -795,7 +814,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("fdopendir", [](Emulator& emu) {
+    reg_locked("fdopendir", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         DIR* dir = fdopendir(fd);
         if (dir) {
@@ -808,7 +827,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("closedir", [](Emulator& emu) {
+    reg_locked("closedir", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         auto it = g_dir_handles.find(handle);
         if (it != g_dir_handles.end()) {
@@ -824,7 +843,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("readdir", [](Emulator& emu) {
+    reg_locked("readdir", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         auto it = g_dir_handles.find(handle);
         if (it != g_dir_handles.end()) {
@@ -844,7 +863,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("readdir_r", [](Emulator& emu) {
+    reg_locked("readdir_r", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t entry_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t result_addr = get_reg(emu, UC_ARM64_REG_X2);
@@ -870,7 +889,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // readdir64 - same as readdir on 64-bit systems
-    hle.register_function("readdir64", [](Emulator& emu) {
+    reg_locked("readdir64", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         auto it = g_dir_handles.find(handle);
         if (it != g_dir_handles.end()) {
@@ -890,7 +909,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // readdir64_r - same as readdir_r on 64-bit systems
-    hle.register_function("readdir64_r", [](Emulator& emu) {
+    reg_locked("readdir64_r", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t entry_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t result_addr = get_reg(emu, UC_ARM64_REG_X2);
@@ -915,7 +934,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // scandirat - scandir relative to directory fd
-    hle.register_function("scandirat", [](Emulator& emu) {
+    reg_locked("scandirat", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t dirp_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t namelist_ptr = get_reg(emu, UC_ARM64_REG_X2);
@@ -974,7 +993,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // scandirat64 - same as scandirat on 64-bit systems
-    hle.register_function("scandirat64", [](Emulator& emu) {
+    reg_locked("scandirat64", [](Emulator& emu) {
         int dirfd = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t dirp_addr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t namelist_ptr = get_reg(emu, UC_ARM64_REG_X2);
@@ -1032,7 +1051,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, count);
     });
 
-    hle.register_function("rewinddir", [](Emulator& emu) {
+    reg_locked("rewinddir", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         auto it = g_dir_handles.find(handle);
         if (it != g_dir_handles.end()) {
@@ -1040,7 +1059,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("seekdir", [](Emulator& emu) {
+    reg_locked("seekdir", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         long loc = get_reg(emu, UC_ARM64_REG_X1);
         auto it = g_dir_handles.find(handle);
@@ -1049,7 +1068,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("telldir", [](Emulator& emu) {
+    reg_locked("telldir", [](Emulator& emu) {
         uint64_t handle = get_reg(emu, UC_ARM64_REG_X0);
         auto it = g_dir_handles.find(handle);
         if (it != g_dir_handles.end()) {
@@ -1063,7 +1082,7 @@ void register_hle_dir(HleManager& hle) {
     // Directory/file manipulation
     // ========================================================================
 
-    hle.register_function("mkdir", [](Emulator& emu) {
+    reg_locked("mkdir", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         mode_t mode = get_reg(emu, UC_ARM64_REG_X1);
         std::string path = read_string(emu, path_addr);
@@ -1075,7 +1094,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("rmdir", [](Emulator& emu) {
+    reg_locked("rmdir", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
         std::string host_path = guest_path_to_host(path);
@@ -1086,7 +1105,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("chdir", [](Emulator& emu) {
+    reg_locked("chdir", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
         std::string host_path = guest_path_to_host(path);
@@ -1097,13 +1116,13 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("fchdir", [](Emulator& emu) {
+    reg_locked("fchdir", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         int result = fchdir(fd);
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("getcwd", [](Emulator& emu) {
+    reg_locked("getcwd", [](Emulator& emu) {
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X0);
         size_t size = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1154,7 +1173,7 @@ void register_hle_dir(HleManager& hle) {
         }
     });
 
-    hle.register_function("unlink", [](Emulator& emu) {
+    reg_locked("unlink", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
         std::string host_path = guest_path_to_host(path);
@@ -1162,7 +1181,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("chmod", [](Emulator& emu) {
+    reg_locked("chmod", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         mode_t mode = get_reg(emu, UC_ARM64_REG_X1);
         std::string path = read_string(emu, path_addr);
@@ -1171,7 +1190,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("fchmod", [](Emulator& emu) {
+    reg_locked("fchmod", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         mode_t mode = get_reg(emu, UC_ARM64_REG_X1);
         int result = fchmod(fd, mode);
@@ -1181,7 +1200,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("chown", [](Emulator& emu) {
+    reg_locked("chown", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uid_t owner = get_reg(emu, UC_ARM64_REG_X1);
         gid_t group = get_reg(emu, UC_ARM64_REG_X2);
@@ -1191,7 +1210,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("fchown", [](Emulator& emu) {
+    reg_locked("fchown", [](Emulator& emu) {
         int fd = get_reg(emu, UC_ARM64_REG_X0);
         uid_t owner = get_reg(emu, UC_ARM64_REG_X1);
         gid_t group = get_reg(emu, UC_ARM64_REG_X2);
@@ -1199,7 +1218,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("link", [](Emulator& emu) {
+    reg_locked("link", [](Emulator& emu) {
         uint64_t oldpath_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t newpath_addr = get_reg(emu, UC_ARM64_REG_X1);
         std::string oldpath = read_string(emu, oldpath_addr);
@@ -1210,7 +1229,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("symlink", [](Emulator& emu) {
+    reg_locked("symlink", [](Emulator& emu) {
         uint64_t target_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t linkpath_addr = get_reg(emu, UC_ARM64_REG_X1);
         std::string target = read_string(emu, target_addr);
@@ -1221,7 +1240,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("readlink", [](Emulator& emu) {
+    reg_locked("readlink", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t buf_addr = get_reg(emu, UC_ARM64_REG_X1);
         size_t bufsiz = get_reg(emu, UC_ARM64_REG_X2);
@@ -1240,7 +1259,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    hle.register_function("realpath", [](Emulator& emu) {
+    reg_locked("realpath", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t resolved_addr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1284,7 +1303,7 @@ void register_hle_dir(HleManager& hle) {
     // ========================================================================
 
     // alphasort - comparison function for scandir
-    hle.register_function("alphasort", [](Emulator& emu) {
+    reg_locked("alphasort", [](Emulator& emu) {
         uint64_t a_ptr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t b_ptr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1305,7 +1324,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // alphasort64 - same as alphasort on 64-bit systems
-    hle.register_function("alphasort64", [](Emulator& emu) {
+    reg_locked("alphasort64", [](Emulator& emu) {
         uint64_t a_ptr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t b_ptr = get_reg(emu, UC_ARM64_REG_X1);
 
@@ -1324,7 +1343,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // scandir - scan a directory for matching entries
-    hle.register_function("scandir", [](Emulator& emu) {
+    reg_locked("scandir", [](Emulator& emu) {
         uint64_t dirp_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t namelist_ptr = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t filter_func = get_reg(emu, UC_ARM64_REG_X2);
@@ -1407,7 +1426,7 @@ void register_hle_dir(HleManager& hle) {
     });
 
     // scandir64 - same as scandir on 64-bit systems
-    hle.register_function("scandir64", [](Emulator& emu) {
+    reg_locked("scandir64", [](Emulator& emu) {
         // Forward to scandir implementation
         uint64_t dirp_addr = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t namelist_ptr = get_reg(emu, UC_ARM64_REG_X1);
@@ -1513,19 +1532,19 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, static_cast<uint64_t>(static_cast<int64_t>(result)));
     };
 
-    hle.register_function("ftw", [run_ftw](Emulator& emu) {
+    reg_locked("ftw", [run_ftw](Emulator& emu) {
         run_ftw(emu, false);
     });
 
-    hle.register_function("ftw64", [run_ftw](Emulator& emu) {
+    reg_locked("ftw64", [run_ftw](Emulator& emu) {
         run_ftw(emu, false);
     });
 
-    hle.register_function("nftw", [run_ftw](Emulator& emu) {
+    reg_locked("nftw", [run_ftw](Emulator& emu) {
         run_ftw(emu, true);
     });
 
-    hle.register_function("nftw64", [run_ftw](Emulator& emu) {
+    reg_locked("nftw64", [run_ftw](Emulator& emu) {
         run_ftw(emu, true);
     });
 
@@ -1596,11 +1615,11 @@ void register_hle_dir(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(guest_result)));
     };
 
-    hle.register_function("glob", [run_glob](Emulator& emu) {
+    reg_locked("glob", [run_glob](Emulator& emu) {
         run_glob(emu);
     });
 
-    hle.register_function("glob64", [run_glob](Emulator& emu) {
+    reg_locked("glob64", [run_glob](Emulator& emu) {
         run_glob(emu);
     });
 
@@ -1623,11 +1642,11 @@ void register_hle_dir(HleManager& hle) {
         }
     };
 
-    hle.register_function("globfree", [run_globfree](Emulator& emu) {
+    reg_locked("globfree", [run_globfree](Emulator& emu) {
         run_globfree(emu);
     });
 
-    hle.register_function("globfree64", [run_globfree](Emulator& emu) {
+    reg_locked("globfree64", [run_globfree](Emulator& emu) {
         run_globfree(emu);
     });
 
@@ -1635,7 +1654,7 @@ void register_hle_dir(HleManager& hle) {
     // File tree walk
     // ========================================================================
 
-    hle.register_function("fts_open", [](Emulator& emu) {
+    reg_locked("fts_open", [](Emulator& emu) {
         uint64_t pathv_addr = get_reg(emu, UC_ARM64_REG_X0);
         int guest_options = get_reg(emu, UC_ARM64_REG_X1);
         uint64_t compar_addr = get_reg(emu, UC_ARM64_REG_X2);
@@ -1702,7 +1721,7 @@ void register_hle_dir(HleManager& hle) {
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fts)));
     });
 
-    hle.register_function("fts_read", [](Emulator& emu) {
+    reg_locked("fts_read", [](Emulator& emu) {
         FTS* fts = reinterpret_cast<FTS*>(
             static_cast<uintptr_t>(get_reg(emu, UC_ARM64_REG_X0)));
 
@@ -1722,7 +1741,7 @@ void register_hle_dir(HleManager& hle) {
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(entry)));
     });
 
-    hle.register_function("fts_set", [](Emulator& emu) {
+    reg_locked("fts_set", [](Emulator& emu) {
         FTS* fts = reinterpret_cast<FTS*>(
             static_cast<uintptr_t>(get_reg(emu, UC_ARM64_REG_X0)));
         FTSENT* entry = reinterpret_cast<FTSENT*>(
@@ -1752,7 +1771,7 @@ void register_hle_dir(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(result)));
     });
 
-    hle.register_function("fts_close", [](Emulator& emu) {
+    reg_locked("fts_close", [](Emulator& emu) {
         FTS* fts = reinterpret_cast<FTS*>(
             static_cast<uintptr_t>(get_reg(emu, UC_ARM64_REG_X0)));
 
@@ -1776,7 +1795,7 @@ void register_hle_dir(HleManager& hle) {
                 static_cast<uint64_t>(static_cast<int64_t>(result)));
     });
 
-    hle.register_function("basename", [](Emulator& emu) {
+    reg_locked("basename", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
 
@@ -1790,7 +1809,7 @@ void register_hle_dir(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, ptr);
     });
 
-    hle.register_function("dirname", [](Emulator& emu) {
+    reg_locked("dirname", [](Emulator& emu) {
         uint64_t path_addr = get_reg(emu, UC_ARM64_REG_X0);
         std::string path = read_string(emu, path_addr);
 
