@@ -1207,6 +1207,12 @@ Emulator::Emulator(const EmulatorConfig &config)
       next_load_addr_(CODE_BASE),
       debug_enabled_(config.enable_debug),
       profile_enabled_(config.enable_profile) {
+    // Allow enabling profiling via env even when the embedding wrapper (tutk_wrapper)
+    // constructs the Emulator with a default config. EMU_PROFILE=1 -> periodic
+    // [EMU_PROFILE] per-call latency breakdown (alloc/queue/sched/exec/signal/TOTAL).
+    if (const char* p = std::getenv("EMU_PROFILE")) {
+        if (std::atoi(p) != 0) profile_enabled_ = true;
+    }
     emu::set_debug_logging_enabled(debug_enabled_);
     emu::set_profile_logging_enabled(profile_enabled_);
     initialize();
