@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 
@@ -48,24 +49,33 @@ inline bool is_profile_logging_enabled() {
 }
 
 // Thread-safe log stream that flushes on destruction (mutex-protected)
+//
+// When disabled (the common Release path), the ctor does NO work: no log-mutex
+// acquisition and — critically — no std::ostringstream construction. Constructing an
+// ostringstream runs std::ios_base::_M_init() (touches the global C++ locale), which is
+// surprisingly expensive and was observed stalling a thread *while it held
+// g_threads_mutex* inside notify_thread_exit, serializing every guest-thread exit and
+// wedging the emulator under thread churn. Building the buffer lazily keeps disabled
+// EMU_LOG calls truly free so they can never hold a lock during ios init.
 class ConditionalLogStream {
 public:
     explicit ConditionalLogStream(bool enabled) : enabled_(enabled) {
         if (enabled_) {
             lock_ = std::unique_lock<std::mutex>(get_log_mutex());
+            buffer_ = std::make_unique<std::ostringstream>();
         }
     }
 
     ~ConditionalLogStream() {
-        if (enabled_) {
-            std::cerr << buffer_.str() << std::flush;
+        if (enabled_ && buffer_) {
+            std::cerr << buffer_->str() << std::flush;
         }
     }
 
     template<typename T>
     ConditionalLogStream& operator<<(const T& value) {
         if (enabled_) {
-            buffer_ << value;
+            *buffer_ << value;
         }
         return *this;
     }
@@ -73,7 +83,7 @@ public:
     // Handle std::endl and other manipulators
     ConditionalLogStream& operator<<(std::ostream& (*manip)(std::ostream&)) {
         if (enabled_) {
-            buffer_ << manip;
+            *buffer_ << manip;
         }
         return *this;
     }
@@ -81,7 +91,7 @@ public:
 private:
     bool enabled_;
     std::unique_lock<std::mutex> lock_;
-    std::ostringstream buffer_;
+    std::unique_ptr<std::ostringstream> buffer_;
 };
 
 // Null stream that discards output

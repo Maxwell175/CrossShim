@@ -702,21 +702,46 @@ static libafl_syshook_ret pre_syscall_hook(
     // Note: We don't call ::_exit() in forked children because QEMU's internal
     // state isn't fully fork-safe and causes crashes. Death tests will timeout
     // but the suite won't take down the host process.
-    if (sys_num == 93 /* SYS_exit */ || sys_num == 94 /* SYS_exit_group */) {
-        int exit_code = static_cast<int>(arg0);
-        if (sys_num == 93 /* SYS_exit */) {
-            notify_thread_exit(hook_sp, static_cast<uint64_t>(arg0), true);
+    if (sys_num == 93 /* SYS_exit */) {
+        // A guest thread is terminating (typically pthread_exit, which MUST be no-return).
+        // Two cases, distinguished by tl_running (set true ONLY inside the worker pool's
+        // Emulator::start() loop; an ordinary guest thread runs QEMU's native cpu_loop and
+        // leaves it false):
+        //
+        //  - Worker vCPU (tl_running): a C->guest call's guest code reached pthread_exit. We
+        //    must NOT run native exit here — host pthread_exit does a forced stack unwind that
+        //    would tear the persistent worker down through call_function's catch(...), which
+        //    swallows it -> glibc "FATAL: exception not rethrown" -> abort. Instead end the
+        //    call like the call-return trampoline: force this worker's cpu_loop to exit so
+        //    Emulator::start() returns to the request loop; the worker survives, the call
+        //    returns failure (-1).
+        //
+        //  - Ordinary guest thread (!tl_running): let QEMU run the NATIVE TARGET_NR_exit so the
+        //    host thread truly terminates (+ cpu_list_remove / rcu_unregister, ending zombie-CPU
+        //    buildup). Its forced unwind runs entirely on QEMU's C clone_func/cpu_loop stack
+        //    (no C++ catch) so it is clean. Relying on emu->stop()+SKIP instead leaves the
+        //    thread running -> it returns from the no-return pthread_exit and runs off the end
+        //    of its caller into adjacent code -> SIGSEGV in code_gen_buffer (the original crash).
+        if (tl_running) {
+            tl_call_return_hit = true;
+            libafl_qemu_trigger_breakpoint(hook_cpu);
+            ret.tag = LIBAFL_SYSHOOK_SKIP;
+            ret.syshook_skip_retval = static_cast<uint64_t>(-1);
+            return ret;
         }
+        notify_thread_exit(hook_sp, static_cast<uint64_t>(arg0), true);
+        ret.tag = LIBAFL_SYSHOOK_RUN;
+        return ret;
+    }
 
-        EMU_LOG << "[SYSCALL] " << (sys_num == 93 ? "exit" : "exit_group")
-                << "(" << exit_code << ") - stopping emulation" << std::endl;
-
-        // Set X0 to the exit code so it can be read after emulation stops.
+    if (sys_num == 94 /* SYS_exit_group */) {
+        // The guest wants the whole process down. Running TARGET_NR_exit_group natively
+        // would _exit the host process (unsafe in forked death-test children; and the C#
+        // host owns process lifetime). Keep skipping: just stop this thread's loop.
+        int exit_code = static_cast<int>(arg0);
+        EMU_LOG << "[SYSCALL] exit_group(" << exit_code << ") - stopping emulation" << std::endl;
         qemu::write_reg(hook_cpu, qemu::REG_X0, static_cast<uint64_t>(arg0));
-
-        // Stop the current thread's emulation loop.
         emu->stop();
-
         ret.tag = LIBAFL_SYSHOOK_SKIP;
         ret.syshook_skip_retval = exit_code;
         return ret;
