@@ -68,6 +68,7 @@ class ThreadManager;
 
 // QEMU types (global namespace)
 struct CPUState;
+struct CPUArchState;
 
 namespace cross_shim {
 
@@ -276,6 +277,47 @@ private:
     std::queue<std::shared_ptr<FunctionRequest>> request_queue_;
     std::mutex queue_mutex_;
     std::condition_variable request_cv_;
+
+    // Per-worker mailboxes for sticky affinity routing. Each calling host thread is
+    // pinned to ONE worker vCPU so a given session's C->guest calls (avRecvFrameData,
+    // etc.) always execute on the SAME guest thread/CPU. Bouncing them across CPUs
+    // corrupts TUTK's per-thread receive/reassembly state (deterministic stall after a
+    // few frames). Index 0 = main emulator thread (bootstrap + spawn); 1..vcpu_worker_count_
+    // = pool workers, which are the affinity targets. Sized once in the constructor.
+    struct WorkerMailbox {
+        std::queue<std::shared_ptr<FunctionRequest>> queue;
+        std::mutex mtx;
+        std::condition_variable cv;
+    };
+    std::vector<std::unique_ptr<WorkerMailbox>> worker_mailboxes_;
+    std::atomic<int> next_affinity_worker_{0};   // round-robin cursor for new caller threads
+    bool spawn_initiated_ = false;               // worker-0-only guard for lazy pool spawn
+    int pick_affinity_worker();                  // sticky worker id for the calling thread
+
+    // --- Parallel vCPU worker pool ---------------------------------------------
+    // Additional worker host threads, each owning its own cloned guest vCPU, that
+    // consume request_queue_ concurrently so C->guest calls (avRecvFrameData2 reads,
+    // etc.) execute in PARALLEL across host cores instead of serializing on the single
+    // emulator_thread_/CPU0. Worker vCPUs are minted via the guest clone() path and
+    // their host threads are diverted into worker_vcpu_loop() by a libafl new-thread
+    // hook (see vcpu_new_thread_hook_cb). usermode linux-user has no real BQL, so these
+    // run truly in parallel.
+    int vcpu_worker_count_ = 0;                 // extra workers beyond the main thread
+    std::atomic<bool> workers_spawned_{false};
+    std::vector<CPUState*> worker_cpus_;
+    // Spawn coordination: each freshly-cloned worker host thread self-binds its OWN vCPU
+    // (env_cpu(env)) from the new-thread hook and is identified by the clone-stub PC, so
+    // concurrent TUTK thread creation can't mis-assign vCPUs.
+    std::mutex worker_handshake_mutex_;
+    std::condition_variable worker_handshake_cv_;
+    bool spawning_workers_ = false;
+    int vcpu_workers_claimed_ = 0;
+    uint64_t vcpu_worker_clone_addr_ = 0;   // guest PC the worker clones resume at
+    void spawn_vcpu_workers();
+    void worker_vcpu_loop(int worker_id, CPUState* cpu);
+    void run_request_loop();                    // shared request-processing loop
+    bool on_vcpu_new_thread(::CPUArchState* env, uint32_t tid);
+    static bool vcpu_new_thread_hook_cb(uint64_t data, ::CPUArchState* env, uint32_t tid);
 
     void emulator_thread_func();  // Background thread function
     // Exception firewall: catches any C++ exception escaping guest execution / HLE and

@@ -60,6 +60,10 @@ constexpr uint64_t SAFE_CALL_STACK_SIZE = 0x00800000ULL;
 constexpr uint64_t SAFE_CALL_STACK_CHUNK = 0x00100000ULL;
 constexpr uint64_t SAFE_CALL_TRAMPOLINE_ADDR = cross_shim::HLE_BASE + 0xFFF80ULL;
 constexpr uint64_t SAFE_CALL_CONTEXT_SIZE = 0x50ULL;
+// Return trampoline for C->guest calls (mov x8,#SYS_CALL_RETURN; svc #0; ret).
+// Sits below the thread exit/resume trampolines at 0x...FFFF0 and the safe-call
+// trampoline at 0x...FFF80, in the slot the old per-depth return addresses used.
+constexpr uint64_t CALL_RETURN_STUB_ADDR = cross_shim::HLE_BASE + 0xFFF00ULL;
 
 }
 
@@ -358,6 +362,14 @@ static Emulator* g_emulator = nullptr;
 // Thread-local CPU pointer for HLE calls
 static thread_local CPUState* tls_cpu = nullptr;
 
+// Parallel vCPU worker pool: per-worker thread-local state.
+// tl_is_worker is true on the main emulator thread AND every pool worker, so a
+// reentrant call_function (HLE handler -> guest) runs inline on the current vCPU
+// instead of cross-dispatching to another worker (which would corrupt context).
+static thread_local bool tl_is_worker = false;
+static thread_local int tl_worker_id = 0;            // 0 = main thread, 1..N = pool workers
+static thread_local uint64_t tl_safe_stack_base = SAFE_CALL_STACK_BASE;
+
 // Get the current CPU for this thread
 CPUState* get_current_cpu(Emulator& emu) {
     if (tls_cpu != nullptr) {
@@ -395,6 +407,11 @@ static constexpr int SYS_THREAD_DONE = 0x1234;
 static constexpr int SYS_THREAD_START = 0x1235;  // Debug marker
 static constexpr int SYS_CLONE_DEBUG = 0x1236;   // Debug after clone
 static constexpr int SYS_CLONE_CHILD_EXIT = 0x1237; // Exit helper for HLE clone children
+// C->guest call-return trampoline. When a guest function called via call_function()
+// returns, LR points at the return stub which issues this syscall. The syscall hook
+// forces a per-thread cpu_loop exit (libafl_qemu_trigger_breakpoint), replacing the
+// old global-breakpoint return-trap that was not thread-safe across the vCPU worker pool.
+static constexpr int SYS_CALL_RETURN = 0x1238;
 
 // HLE syscall base and mapping (defined in allocate_stub, used in pre_syscall_hook)
 static constexpr int HLE_SYSCALL_BASE = 0x2000;
@@ -408,6 +425,16 @@ static std::atomic<int> g_next_hle_syscall{HLE_SYSCALL_BASE};
 // thread finishing its start() call would set running_=false and terminate
 // the main thread's execution loop prematurely.
 static thread_local bool tl_running = false;
+
+// Set by the syscall hook when this thread's C->guest call returns through the
+// call-return trampoline (SYS_CALL_RETURN). start() consumes it to stop the run
+// loop. Thread-local so each vCPU worker tracks its own call independently.
+static thread_local bool tl_call_return_hit = false;
+
+// Sticky worker affinity for a calling (non-worker) host thread: the pool worker id
+// this thread's C->guest calls are always routed to. -1 until first assigned. Keeps a
+// given session's calls on ONE guest CPU (see pick_affinity_worker / call_function).
+static thread_local int tl_affinity_worker = -1;
 
 // CRITICAL FIX: Mutex for HLE handler serialization
 // This provides the same synchronization that verbose logging provides
@@ -542,6 +569,19 @@ static libafl_syshook_ret pre_syscall_hook(
         int exit_code = static_cast<int>(arg0);
         EMU_LOG << "[SYSCALL] SYS_CLONE_CHILD_EXIT(" << exit_code << ")" << std::endl;
         ::_exit(exit_code);
+    }
+
+    // C->guest call returned through the call-return trampoline. Force a clean,
+    // per-thread exit from cpu_loop using only __thread exit state (no global
+    // breakpoint list, no cross-CPU TB flush), then hand X0 back unchanged so the
+    // guest function's return value survives cpu_loop's post-syscall X0 write-back.
+    if (sys_num == SYS_CALL_RETURN) {
+        uint64_t real_ret = qemu::read_reg(hook_cpu, qemu::REG_X0);
+        tl_call_return_hit = true;
+        libafl_qemu_trigger_breakpoint(hook_cpu);
+        ret.tag = LIBAFL_SYSHOOK_SKIP;
+        ret.syshook_skip_retval = real_ret;
+        return ret;
     }
 
     if (sys_num == 22 /* SYS_epoll_pwait */) {
@@ -1213,6 +1253,24 @@ Emulator::Emulator(const EmulatorConfig &config)
     if (const char* p = std::getenv("EMU_PROFILE")) {
         if (std::atoi(p) != 0) profile_enabled_ = true;
     }
+
+    // Parallel vCPU worker pool size (extra worker threads/vCPUs beyond the main thread).
+    // ON by default so C->guest calls (camera frame reads) run in parallel across cores.
+    // Override with CROSSSHIM_VCPU_WORKERS (0 = legacy single-worker behavior).
+    vcpu_worker_count_ = 8;
+    if (const char* w = std::getenv("CROSSSHIM_VCPU_WORKERS")) {
+        int v = std::atoi(w);
+        vcpu_worker_count_ = (v < 0) ? 0 : v;
+    }
+
+    // One mailbox per worker slot: index 0 = main emulator thread, 1..N = pool workers.
+    // Created before initialize() (which starts the emulator thread) so worker 0 has its
+    // mailbox ready immediately.
+    worker_mailboxes_.clear();
+    for (int i = 0; i <= vcpu_worker_count_; ++i) {
+        worker_mailboxes_.push_back(std::make_unique<WorkerMailbox>());
+    }
+
     emu::set_debug_logging_enabled(debug_enabled_);
     emu::set_profile_logging_enabled(profile_enabled_);
     initialize();
@@ -1314,6 +1372,23 @@ void Emulator::initialize() {
                         sizeof(safe_call_trampoline))) {
         EMU_ALWAYS_LOG << "[EMU] WARNING: Failed to write safe-call trampoline at 0x"
                 << std::hex << SAFE_CALL_TRAMPOLINE_ADDR << std::dec << std::endl;
+    }
+
+    // Guest-side return trampoline for C->guest calls. call_function() sets LR to
+    // this address; when the called function returns, the SVC triggers a per-thread
+    // cpu_loop exit via the syscall hook (SYS_CALL_RETURN). This replaces the old
+    // global-breakpoint return-trap, which raced across the parallel vCPU worker pool.
+    // A single shared stub serves all workers and all nesting depths: the trap is
+    // thread-local, so there is no address collision to avoid.
+    static const uint32_t call_return_trampoline[] = {
+        0xD2824708,  // mov x8, #0x1238   (SYS_CALL_RETURN)
+        0xD4000001,  // svc #0
+        0xD65F03C0,  // ret               (safety net; hook forces exit at the svc)
+    };
+    if (!memory_->write(CALL_RETURN_STUB_ADDR, call_return_trampoline,
+                        sizeof(call_return_trampoline))) {
+        EMU_ALWAYS_LOG << "[EMU] WARNING: Failed to write call-return trampoline at 0x"
+                << std::hex << CALL_RETURN_STUB_ADDR << std::dec << std::endl;
     }
 
     // Initialize global data (writes ctype table, etc. to host memory)
@@ -1625,7 +1700,7 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
     uint64_t sp = qemu::read_reg(cpu, qemu::REG_SP);
     bool in_main_stack = sp >= STACK_BASE - config_.stack_size && sp <= STACK_BASE;
     bool in_safe_call_stack =
-        sp >= SAFE_CALL_STACK_BASE && sp <= SAFE_CALL_STACK_BASE + SAFE_CALL_STACK_SIZE;
+        sp >= tl_safe_stack_base && sp <= tl_safe_stack_base + SAFE_CALL_STACK_SIZE;
     bool in_mapped_stack = (sp != 0) && memory_ != nullptr && memory_->is_mapped(sp);
     if (sp == 0 || (!in_main_stack && !in_safe_call_stack && !in_mapped_stack)) {
         // Initialize stack pointer to top of stack
@@ -1634,10 +1709,10 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
         EMU_LOG << "[EMU] Set SP to 0x" << std::hex << sp << std::dec << std::endl;
     }
 
-    // Set up a breakpoint at the end address so we stop there
-    if (end_address != 0) {
-        libafl_qemu_set_breakpoint(end_address);
-    }
+    // NOTE: No breakpoint is set at end_address. C->guest calls stop via the
+    // call-return trampoline (SYS_CALL_RETURN -> tl_call_return_hit), a per-thread
+    // signal that is safe across the parallel vCPU worker pool. end_address is kept
+    // only as a defensive secondary PC check below.
 
     EMU_LOG_VERBOSE << "[EMU] Starting execution at 0x" << std::hex << address
               << " (end=0x" << end_address << ")"
@@ -1670,6 +1745,14 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
         // Run QEMU until it stops (breakpoint, syscall, etc.)
         EMU_LOG_VERBOSE << "[EMU] Calling libafl_qemu_run(), loop=" << loop_count << std::endl;
         int result = libafl_qemu_run();
+
+        // Primary stop: our C->guest call-return trampoline fired. This is a
+        // thread-local signal set by the syscall hook (SYS_CALL_RETURN), so it
+        // identifies exactly this thread's call returning, with no global state.
+        if (tl_call_return_hit) {
+            tl_call_return_hit = false;
+            break;
+        }
 
         EMU_LOG_VERBOSE << "[EMU] After run " << loop_count << ": result=" << result << std::endl;
 
@@ -1893,10 +1976,8 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
         continue;
     }
 
-    // Remove the breakpoint if we set one
-    if (end_address != 0) {
-        libafl_qemu_remove_breakpoint(end_address);
-    }
+    // No breakpoint to remove: call returns are trapped via the SVC trampoline,
+    // not the global libafl breakpoint list.
 
     // Clean up any debug instruction hooks
     if (!g_debug_instruction_hooks.empty()) {
@@ -2029,13 +2110,199 @@ void Emulator::stop_emulator_thread() {
     EMU_LOG << "[EMU] Stopping emulator background thread" << std::endl;
     should_stop_ = true;
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        request_cv_.notify_all();
+    // Wake every worker waiting on its own mailbox so they observe should_stop_.
+    for (auto& mb : worker_mailboxes_) {
+        std::lock_guard<std::mutex> lock(mb->mtx);
+        mb->cv.notify_all();
     }
 
     emulator_thread_.join();
     EMU_LOG << "[EMU] Emulator background thread stopped" << std::endl;
+}
+
+// libafl new-thread hook trampoline: every guest clone()'d thread passes through here
+// before entering cpu_loop. We use it to divert OUR worker vCPUs into worker_vcpu_loop().
+bool Emulator::vcpu_new_thread_hook_cb(uint64_t data, ::CPUArchState* env, uint32_t tid) {
+    return reinterpret_cast<Emulator*>(data)->on_vcpu_new_thread(env, tid);
+}
+
+bool Emulator::on_vcpu_new_thread(::CPUArchState* env, uint32_t tid) {
+    (void)tid;
+    {
+        std::lock_guard<std::mutex> lk(worker_handshake_mutex_);
+        if (!spawning_workers_) {
+            return true;  // ordinary guest (TUTK) thread -> clone_func runs cpu_loop(env)
+        }
+    }
+    // Identify OUR worker clones by where they resume (the clone stub). TUTK threads
+    // created concurrently during the spawn window resume at the thread wrapper instead.
+    CPUState* cpu = libafl_qemu_cpu_from_env(env);
+    uint64_t pc = cpu ? qemu::read_reg(cpu, qemu::REG_PC) : 0;
+    if (cpu == nullptr || pc < vcpu_worker_clone_addr_ || pc >= vcpu_worker_clone_addr_ + 0x10) {
+        return true;  // not one of ours
+    }
+
+    int worker_id;
+    {
+        std::lock_guard<std::mutex> lk(worker_handshake_mutex_);
+        worker_id = ++vcpu_workers_claimed_;
+        worker_cpus_.push_back(cpu);
+        worker_handshake_cv_.notify_all();  // let spawn_vcpu_workers() proceed
+    }
+
+    // Become a permanent worker on THIS vCPU. Never returns until shutdown, so clone_func
+    // never enters cpu_loop for this thread. libafl_qemu_env was already set to this
+    // thread's env by libafl_hook_new_thread_run; current_cpu is set in worker_vcpu_loop.
+    worker_vcpu_loop(worker_id, cpu);
+    return false;  // on shutdown: clone_func returns, host thread exits cleanly
+}
+
+void Emulator::spawn_vcpu_workers() {
+    int n = vcpu_worker_count_;
+    if (n <= 0) {
+        EMU_ALWAYS_LOG << "[EMU] vCPU worker pool disabled (count=0)" << std::endl;
+        return;
+    }
+
+    // Issue a DIRECT SYS_clone rather than going through pthread_create's HLE handler:
+    // SYS_clone (220) is handled by QEMU natively (do_fork), which mints a vCPU + host
+    // thread and fires our new-thread hook. (pthread_create's HLE redirects PC to a clone
+    // trampoline, which isn't honored when invoked as an isolated call_function.)
+    // Write a tiny guest stub once: mov x8,#220 ; svc #0 ; ret.
+    const uint64_t clone_stub_addr = HLE_BASE + 0x90000;  // free slot in the exec HLE region
+    {
+        uint32_t code[3] = {
+            0xD2801B88,  // movz x8, #220   (SYS_clone)
+            0xD4000001,  // svc  #0
+            0xD65F03C0,  // ret
+        };
+        if (!memory_->write(clone_stub_addr, code, sizeof(code))) {
+            EMU_ALWAYS_LOG << "[EMU] vCPU pool: failed to write clone stub; staying single-worker"
+                           << std::endl;
+            return;
+        }
+    }
+    // CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM (no tid/tls flags so x2..x4 may be 0).
+    const uint64_t clone_flags = 0x50F00;
+    vcpu_worker_clone_addr_ = clone_stub_addr;  // workers resume at clone_stub_addr+8
+
+    EMU_ALWAYS_LOG << "[EMU] vCPU pool: spawning " << n << " parallel worker vCPUs..." << std::endl;
+    {
+        std::lock_guard<std::mutex> lk(worker_handshake_mutex_);
+        spawning_workers_ = true;
+        vcpu_workers_claimed_ = 0;
+    }
+
+    int spawned = 0;
+    for (int i = 1; i <= n; ++i) {
+        // Per-worker safe-call stack region so nested HLE->guest (safe) calls on different
+        // workers never collide on the shared 0xA0000000 region.
+        uint64_t region = SAFE_CALL_STACK_BASE + static_cast<uint64_t>(i) * SAFE_CALL_STACK_SIZE;
+        if (region + SAFE_CALL_STACK_SIZE > GLOBAL_DATA_BASE) {
+            EMU_ALWAYS_LOG << "[EMU] vCPU pool: out of safe-stack space at " << (i - 1) << std::endl;
+            break;
+        }
+        memory_->map(region, SAFE_CALL_STACK_SIZE, MEM_READ | MEM_WRITE, "WorkerSafeStack");
+
+        // Per-worker child stack (do_fork needs a valid child stack pointer; the worker
+        // never actually runs guest code on it -- the hook diverts before cpu_loop).
+        const uint64_t child_stack_size = 0x40000;  // 256KB
+        uint64_t child_stack = memory().heap().allocate(child_stack_size, 16);
+        uint64_t child_sp = child_stack + child_stack_size - 16;
+
+        int cpus_before = libafl_qemu_num_cpus();
+        // Direct SYS_clone on CPU0 -> do_fork -> new vCPU + host thread -> new-thread hook,
+        // which self-binds the worker (identified by the clone-stub PC) via env_cpu.
+        call_function_internal(clone_stub_addr, {clone_flags, child_sp, 0, 0, 0}, false);
+        if (libafl_qemu_num_cpus() <= cpus_before) {
+            EMU_ALWAYS_LOG << "[EMU] vCPU pool: clone made no vCPU; stopping at " << (i - 1) << std::endl;
+            break;
+        }
+        // Wait for the hook to claim this worker before issuing the next clone.
+        {
+            std::unique_lock<std::mutex> lk(worker_handshake_mutex_);
+            worker_handshake_cv_.wait(lk, [this, i] { return vcpu_workers_claimed_ >= i; });
+        }
+        spawned = i;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(worker_handshake_mutex_);
+        spawning_workers_ = false;
+        worker_handshake_cv_.notify_all();  // release workers from the post-spawn barrier
+    }
+    EMU_ALWAYS_LOG << "[EMU] vCPU pool: " << spawned << " parallel workers online" << std::endl;
+}
+
+void Emulator::worker_vcpu_loop(int worker_id, CPUState* cpu) {
+    tl_worker_id = worker_id;
+    tl_is_worker = true;
+    tls_cpu = cpu;  // HLE handlers on this host thread use this vCPU
+    tl_safe_stack_base = SAFE_CALL_STACK_BASE + static_cast<uint64_t>(worker_id) * SAFE_CALL_STACK_SIZE;
+    libafl_qemu_set_current_cpu(cpu);  // current_cpu = this worker's vCPU
+
+    // Barrier: don't start consuming requests until ALL workers are spawned, so the
+    // spawn loop's libafl_qemu_get_cpu(num_cpus-1) bookkeeping isn't perturbed by a
+    // worker running guest code (which could itself create CPUs).
+    {
+        std::unique_lock<std::mutex> lk(worker_handshake_mutex_);
+        worker_handshake_cv_.wait(lk, [this] { return !spawning_workers_; });
+    }
+
+    EMU_ALWAYS_LOG << "[EMU] vCPU worker " << worker_id << " online (cpu_index="
+                   << libafl_qemu_cpu_index(cpu) << ")" << std::endl;
+    run_request_loop();
+}
+
+void Emulator::run_request_loop() {
+    // Each worker consumes ONLY its own mailbox so affinity routing is honored: a calling
+    // thread pinned to worker K is always serviced by worker K's vCPU.
+    WorkerMailbox& mb = *worker_mailboxes_[tl_worker_id];
+    while (!should_stop_) {
+        std::shared_ptr<FunctionRequest> request;
+        {
+            std::unique_lock<std::mutex> lock(mb.mtx);
+            mb.cv.wait(lock, [&] {
+                return !mb.queue.empty() || should_stop_;
+            });
+            if (should_stop_) break;
+            if (!mb.queue.empty()) {
+                request = mb.queue.front();
+                mb.queue.pop();
+            }
+        }
+        if (!request) continue;
+
+        // Lazily spawn the parallel vCPU worker pool once the guest has already created at
+        // least one thread of its own (num_cpus > 1). That guarantees the clone trampoline
+        // is written and the QEMU clone()/do_fork path is live, so our worker clones
+        // actually mint vCPUs. Only the main thread (worker_id 0) spawns. workers_spawned_
+        // is published only AFTER the pool is online, so affinity routing to 1..N can't
+        // target a worker that isn't consuming its mailbox yet.
+        if (tl_worker_id == 0 && !spawn_initiated_ && libafl_qemu_num_cpus() > 1) {
+            spawn_initiated_ = true;
+            spawn_vcpu_workers();
+            workers_spawned_.store(true, std::memory_order_release);
+        }
+
+#if EMU_LOGGING_ENABLED
+        if (emu::is_profile_logging_enabled()) {
+            request->t_dequeued = std::chrono::steady_clock::now();
+            request->t_exec_start = request->t_dequeued;
+        }
+#endif
+        uint64_t result = call_function_internal(request->address, request->args,
+                                                  request->is_safe_call,
+                                                  request->safe_stack_top);
+#if EMU_LOGGING_ENABLED
+        if (emu::is_profile_logging_enabled()) {
+            request->t_exec_end = std::chrono::steady_clock::now();
+        }
+#endif
+        request->result = result;
+        request->completed.store(true, std::memory_order_release);
+        request->cv.notify_one();
+    }
 }
 
 void Emulator::emulator_thread_func() {
@@ -2094,50 +2361,20 @@ void Emulator::emulator_thread_func() {
         }
     }
 
-    // No need to register with TCG - we ARE the main QEMU thread now
+    // No need to register with TCG - we ARE the main QEMU thread now.
+    // This is worker 0; pool workers (1..N) are minted lazily on the first request.
+    tl_is_worker = true;
+    tl_worker_id = 0;
+    tl_safe_stack_base = SAFE_CALL_STACK_BASE;
 
-    while (!should_stop_) {
-        std::shared_ptr<FunctionRequest> request;
-
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            request_cv_.wait(lock, [this] {
-                return !request_queue_.empty() || should_stop_;
-            });
-
-            if (should_stop_) break;
-
-            if (!request_queue_.empty()) {
-                request = request_queue_.front();
-                request_queue_.pop();
-            }
-        }
-
-        if (request) {
-#if EMU_LOGGING_ENABLED
-            if (emu::is_profile_logging_enabled()) {
-                request->t_dequeued = std::chrono::steady_clock::now();
-                request->t_exec_start = request->t_dequeued;  // Same for now
-            }
-#endif
-            uint64_t result = call_function_internal(request->address, request->args,
-                                                      request->is_safe_call,
-                                                      request->safe_stack_top);
-#if EMU_LOGGING_ENABLED
-            if (emu::is_profile_logging_enabled()) {
-                request->t_exec_end = std::chrono::steady_clock::now();
-            }
-#endif
-
-            // Store result and set completed atomically
-            // Use acquire-release semantics to ensure result is visible before completed
-            request->result = result;
-            request->completed.store(true, std::memory_order_release);
-
-            // Still notify for callers that fell through to CV wait
-            request->cv.notify_one();
-        }
+    // Register the new-thread hook so the worker vCPUs we clone get diverted into
+    // worker_vcpu_loop() instead of running cpu_loop(). Ordinary guest (TUTK) threads
+    // are untouched (the hook returns true for them).
+    if (vcpu_worker_count_ > 0) {
+        libafl_add_new_thread_hook(vcpu_new_thread_hook_cb, reinterpret_cast<uint64_t>(this));
     }
+
+    run_request_loop();
 
     EMU_LOG << "[EMU] Emulator thread exiting" << std::endl;
 }
@@ -2181,8 +2418,38 @@ static inline void update_max(std::atomic<uint64_t>& max_val, uint64_t val) {
 }
 #endif
 
+// Choose the worker vCPU that should run this calling thread's C->guest calls.
+// Sticky per-thread: the first call assigns a pool worker (round-robin over 1..N) and
+// every later call from the same thread reuses it, so a session's calls never bounce
+// across CPUs. Before the pool is up (or in legacy single-worker mode) we route to the
+// main emulator thread (slot 0) and DON'T cache, so the thread upgrades to a real worker
+// once the pool comes online.
+int Emulator::pick_affinity_worker() {
+    if (workers_spawned_.load(std::memory_order_acquire) && vcpu_worker_count_ > 0) {
+        // Diagnostic override: CROSSSHIM_PIN_WORKER=K forces every C->guest call onto
+        // worker K (no spreading). Lets us isolate "spreading across cpus breaks TUTK"
+        // (works when pinned) from "single worker cpu / HLE state is broken" (still stalls).
+        static const int pinned = [] {
+            const char* p = std::getenv("CROSSSHIM_PIN_WORKER");
+            return p ? std::atoi(p) : -1;
+        }();
+        if (pinned >= 0) return (pinned > vcpu_worker_count_) ? vcpu_worker_count_ : pinned;
+
+        if (tl_affinity_worker < 1) {
+            tl_affinity_worker =
+                1 + (next_affinity_worker_.fetch_add(1, std::memory_order_relaxed) %
+                     vcpu_worker_count_);
+        }
+        return tl_affinity_worker;
+    }
+    return 0;
+}
+
 uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& args) {
-    if (std::this_thread::get_id() == emulator_thread_id_) {
+    // If we're already executing on a pool worker (or the main emulator thread), run
+    // inline on THIS thread's vCPU. This covers reentrancy (an HLE handler calling back
+    // into guest code) and avoids cross-dispatching to a different worker/vCPU.
+    if (tl_is_worker) {
         return call_function_internal(address, args, false);
     }
 
@@ -2210,11 +2477,12 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
 #endif
 
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        request_queue_.push(request);
+        WorkerMailbox& mb = *worker_mailboxes_[pick_affinity_worker()];
+        std::lock_guard<std::mutex> lock(mb.mtx);
+        mb.queue.push(request);
         // CRITICAL: Notify WHILE holding the lock to prevent lost wakeups.
-        // The race was: unlock -> emulator checks queue (sees old state) -> notify (lost)
-        request_cv_.notify_one();
+        // The race was: unlock -> worker checks queue (sees old state) -> notify (lost)
+        mb.cv.notify_one();
     }
 
 #if EMU_LOGGING_ENABLED
@@ -2345,10 +2613,11 @@ uint64_t Emulator::call_function_safe_on_stack(uint64_t address, uint64_t stack_
     request->safe_stack_top = stack_top;
 
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        request_queue_.push(request);
+        WorkerMailbox& mb = *worker_mailboxes_[pick_affinity_worker()];
+        std::lock_guard<std::mutex> lock(mb.mtx);
+        mb.queue.push(request);
         // CRITICAL: Notify WHILE holding the lock to prevent lost wakeups
-        request_cv_.notify_one();
+        mb.cv.notify_one();
     }
 
     {
@@ -2508,10 +2777,10 @@ uint64_t Emulator::call_function_internal_impl(uint64_t address, const std::vect
             }
 
             target_sp =
-                SAFE_CALL_STACK_BASE + SAFE_CALL_STACK_SIZE - stack_offset - 0x100 - stack_arg_bytes;
+                tl_safe_stack_base + SAFE_CALL_STACK_SIZE - stack_offset - 0x100 - stack_arg_bytes;
             frame_base = target_sp - SAFE_CALL_CONTEXT_SIZE;
             uint64_t chunk_base =
-                SAFE_CALL_STACK_BASE + SAFE_CALL_STACK_SIZE - stack_offset - SAFE_CALL_STACK_CHUNK;
+                tl_safe_stack_base + SAFE_CALL_STACK_SIZE - stack_offset - SAFE_CALL_STACK_CHUNK;
             if (frame_base < chunk_base + 0x100) {
                 EMU_ALWAYS_LOG << "[EMU] ERROR: safe call frame exhausted stack chunk at depth "
                         << next_call_depth << std::endl;
@@ -2576,14 +2845,13 @@ uint64_t Emulator::call_function_internal_impl(uint64_t address, const std::vect
         }
     }
 
-    // Use unique return address for each call level to support nested calls
-    // Each nested call gets a different ret_addr so the inner call doesn't
-    // prematurely terminate the outer call when it returns.
-    // NOTE: We must avoid addresses that conflict with HLE trampolines:
-    //   0x100ffff0-0x100ffffc are used for thread exit/resume trampolines
-    // So we use 0x100fff00 - call_depth*4 to stay safely below those addresses.
+    // Return through the shared call-return trampoline. A single address serves all
+    // call levels and all vCPU workers: the SVC there traps back per-thread (via
+    // tl_call_return_hit), so there is no cross-call or cross-worker address collision
+    // to avoid, and nesting is handled by start()'s re-entrant run loop. call_depth is
+    // still tracked because the safe-call stack chunk is selected by depth above.
     call_depth = next_call_depth;
-    uint64_t ret_addr = HLE_BASE + 0xFFF00 - (call_depth * 4);
+    uint64_t ret_addr = CALL_RETURN_STUB_ADDR;
     qemu::write_reg(cpu, qemu::REG_LR, ret_addr);
 
     EMU_LOG_VERBOSE << "[EMU] call_function_internal: call_depth=" << call_depth

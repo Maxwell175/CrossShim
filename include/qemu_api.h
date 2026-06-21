@@ -375,6 +375,11 @@ uint64_t libafl_get_initial_brk(void);
  */
 void libafl_set_qemu_env(CPUArchState* env);
 
+/**
+ * Resolve the CPUState that owns a given CPUArchState (CrossShim vCPU pool).
+ */
+CPUState* libafl_qemu_cpu_from_env(CPUArchState* env);
+
 // =============================================================================
 // Breakpoints
 // =============================================================================
@@ -392,6 +397,15 @@ size_t libafl_qemu_set_breakpoint(uint64_t addr);
  * @return 1 if removed, 0 if not found
  */
 int libafl_qemu_remove_breakpoint(uint64_t addr);
+
+/**
+ * Trigger a breakpoint-style exit from cpu_loop for the given CPU.
+ * Uses only per-thread (__thread) exit state - no global breakpoint list and no
+ * cross-CPU TB flush - so it is safe to call concurrently from multiple vCPU
+ * worker threads (e.g. from the syscall hook to stop a C->guest call).
+ * @param cpu CPU state that should exit its run loop
+ */
+void libafl_qemu_trigger_breakpoint(CPUState* cpu);
 
 // =============================================================================
 // Exit/Crash Handling
