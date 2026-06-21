@@ -2526,52 +2526,18 @@ int ThreadManager::pthread_setspecific(uint64_t key, uint64_t value) {
 // ============================================================================
 
 ssize_t ThreadManager::blocking_recv(int sockfd, uint64_t buf_ptr, size_t len, int flags) {
-    // Set socket to non-blocking
-    int orig_flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
-
-    // Try the recv
+    // MTTCG: each worker (and each guest thread) runs on its own host thread, so we issue
+    // the recv directly and honor the socket's OWN blocking mode. A blocking socket blocks
+    // only this host thread; a non-blocking socket returns EAGAIN for the guest to poll.
+    // The old cooperative path (force O_NONBLOCK + block_current_thread + context_switch)
+    // mutated shared scheduler state (current_thread_id_/runnable_queue_) and clobbered
+    // another worker's guest registers when two workers raced here. (connect was already
+    // converted to a direct host call for the same reason.)
     std::vector<char> buf(len);
     ssize_t result = ::recv(sockfd, buf.data(), len, flags);
-
-    if (result >= 0) {
-        // Success - write data to emulator memory
-        if (result > 0) {
-            emu_.mem_write(buf_ptr, buf.data(), result);
-        }
-        fcntl(sockfd, F_SETFL, orig_flags);  // Restore blocking mode
-        return result;
+    if (result > 0) {
+        emu_.mem_write(buf_ptr, buf.data(), result);
     }
-
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Would block - save state and context switch
-        {
-            std::lock_guard<std::mutex> lock(threads_mutex_);
-            auto it = threads_.find(current_thread_id_);
-            if (it != threads_.end()) {
-                it->second->io_operation = ThreadContext::IoOperation::RECV;
-                it->second->io_fd = sockfd;
-                it->second->io_buf_ptr = buf_ptr;
-                it->second->io_len = len;
-                it->second->io_flags = flags;
-
-                // Save return address
-                it->second->io_return_addr = get_reg(emu_, UC_ARM64_REG_LR);
-
-                // Set PC to resume function
-                uint64_t resume_addr = HLE_BASE + 0xFFFE0;  // recv resume address
-                it->second->registers.pc = resume_addr;
-            }
-        }
-
-        fcntl(sockfd, F_SETFL, orig_flags);  // Restore blocking mode
-        block_current_thread(ThreadState::IO_WAIT, sockfd);
-        context_switch(SwitchReason::BLOCKING_OPERATION);
-        return CONTEXT_SWITCH_OCCURRED;
-    }
-
-    // Real error
-    fcntl(sockfd, F_SETFL, orig_flags);
     return result;
 }
 
@@ -2649,48 +2615,11 @@ void ThreadManager::blocking_recv_resume() {
 }
 
 ssize_t ThreadManager::blocking_send(int sockfd, uint64_t buf_ptr, size_t len, int flags) {
-    // Read data from emulator memory
+    // MTTCG: direct send honoring the socket's own mode (see blocking_recv). No cooperative
+    // context switch — that raced concurrent workers on the shared scheduler state.
     std::vector<char> buf(len);
     emu_.mem_read(buf_ptr, buf.data(), len);
-
-    // Set socket to non-blocking
-    int orig_flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
-
-    ssize_t result = ::send(sockfd, buf.data(), len, flags);
-
-    if (result >= 0) {
-        fcntl(sockfd, F_SETFL, orig_flags);
-        return result;
-    }
-
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Would block - save state and context switch
-        {
-            std::lock_guard<std::mutex> lock(threads_mutex_);
-            auto it = threads_.find(current_thread_id_);
-            if (it != threads_.end()) {
-                it->second->io_operation = ThreadContext::IoOperation::SEND;
-                it->second->io_fd = sockfd;
-                it->second->io_buf_ptr = buf_ptr;
-                it->second->io_len = len;
-                it->second->io_flags = flags;
-
-                it->second->io_return_addr = get_reg(emu_, UC_ARM64_REG_LR);
-
-                uint64_t resume_addr = HLE_BASE + 0xFFFE4;  // send resume address
-                it->second->registers.pc = resume_addr;
-            }
-        }
-
-        fcntl(sockfd, F_SETFL, orig_flags);
-        block_current_thread(ThreadState::IO_WAIT, sockfd);
-        context_switch(SwitchReason::BLOCKING_OPERATION);
-        return CONTEXT_SWITCH_OCCURRED;
-    }
-
-    fcntl(sockfd, F_SETFL, orig_flags);
-    return result;
+    return ::send(sockfd, buf.data(), len, flags);
 }
 
 void ThreadManager::blocking_send_resume() {
@@ -2760,9 +2689,8 @@ void ThreadManager::blocking_send_resume() {
 
 ssize_t ThreadManager::blocking_recvfrom(int sockfd, uint64_t buf_ptr, size_t len, int flags,
                                          uint64_t addr_ptr, uint64_t addrlen_ptr) {
-    int orig_flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
-
+    // MTTCG: direct recvfrom honoring the socket's own mode (see blocking_recv). No
+    // cooperative context switch — that raced concurrent workers on shared scheduler state.
     std::vector<char> buf(len);
     struct sockaddr_storage addr {};
     socklen_t addrlen = sizeof(addr);
@@ -2781,34 +2709,7 @@ ssize_t ThreadManager::blocking_recvfrom(int sockfd, uint64_t buf_ptr, size_t le
         if (addrlen_ptr) {
             emu_.mem_write(addrlen_ptr, &addrlen, sizeof(addrlen));
         }
-        fcntl(sockfd, F_SETFL, orig_flags);
-        return result;
     }
-
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        {
-            std::lock_guard<std::mutex> lock(threads_mutex_);
-            auto it = threads_.find(current_thread_id_);
-            if (it != threads_.end()) {
-                it->second->io_operation = ThreadContext::IoOperation::RECVFROM;
-                it->second->io_fd = sockfd;
-                it->second->io_buf_ptr = buf_ptr;
-                it->second->io_len = len;
-                it->second->io_flags = flags;
-                it->second->io_addr_ptr = addr_ptr;
-                it->second->io_addrlen_ptr = addrlen_ptr;
-                it->second->io_return_addr = get_reg(emu_, UC_ARM64_REG_LR);
-                it->second->registers.pc = HLE_BASE + 0xFFFCC;
-            }
-        }
-
-        fcntl(sockfd, F_SETFL, orig_flags);
-        block_current_thread(ThreadState::IO_WAIT, sockfd);
-        context_switch(SwitchReason::BLOCKING_OPERATION);
-        return CONTEXT_SWITCH_OCCURRED;
-    }
-
-    fcntl(sockfd, F_SETFL, orig_flags);
     return result;
 }
 
@@ -2897,6 +2798,8 @@ void ThreadManager::blocking_recvfrom_resume() {
 
 ssize_t ThreadManager::blocking_sendto(int sockfd, uint64_t buf_ptr, size_t len, int flags,
                                        uint64_t addr_ptr, uint64_t addrlen) {
+    // MTTCG: direct sendto honoring the socket's own mode (see blocking_recv). No
+    // cooperative context switch — that raced concurrent workers on shared scheduler state.
     std::vector<char> buf(len);
     emu_.mem_read(buf_ptr, buf.data(), len);
 
@@ -2905,47 +2808,13 @@ ssize_t ThreadManager::blocking_sendto(int sockfd, uint64_t buf_ptr, size_t len,
         emu_.mem_read(addr_ptr, addr_buf.data(), addrlen);
     }
 
-    int orig_flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, orig_flags | O_NONBLOCK);
-
-    ssize_t result = ::sendto(
+    return ::sendto(
         sockfd,
         buf.data(),
         len,
         flags,
         (addr_ptr && addrlen > 0) ? reinterpret_cast<struct sockaddr*>(addr_buf.data()) : nullptr,
         static_cast<socklen_t>(addrlen));
-
-    if (result >= 0) {
-        fcntl(sockfd, F_SETFL, orig_flags);
-        return result;
-    }
-
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        {
-            std::lock_guard<std::mutex> lock(threads_mutex_);
-            auto it = threads_.find(current_thread_id_);
-            if (it != threads_.end()) {
-                it->second->io_operation = ThreadContext::IoOperation::SENDTO;
-                it->second->io_fd = sockfd;
-                it->second->io_buf_ptr = buf_ptr;
-                it->second->io_len = len;
-                it->second->io_flags = flags;
-                it->second->io_addr_ptr = addr_ptr;
-                it->second->io_addrlen_ptr = addrlen;
-                it->second->io_return_addr = get_reg(emu_, UC_ARM64_REG_LR);
-                it->second->registers.pc = HLE_BASE + 0xFFFD0;
-            }
-        }
-
-        fcntl(sockfd, F_SETFL, orig_flags);
-        block_current_thread(ThreadState::IO_WAIT, sockfd);
-        context_switch(SwitchReason::BLOCKING_OPERATION);
-        return CONTEXT_SWITCH_OCCURRED;
-    }
-
-    fcntl(sockfd, F_SETFL, orig_flags);
-    return result;
 }
 
 void ThreadManager::blocking_sendto_resume() {
