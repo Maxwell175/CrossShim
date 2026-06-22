@@ -2324,9 +2324,23 @@ void Emulator::run_request_loop() {
             request->t_exec_end = std::chrono::steady_clock::now();
         }
 #endif
-        request->result = result;
-        request->completed.store(true, std::memory_order_release);
-        request->cv.notify_one();
+        {
+            // Publish result + completed WHILE HOLDING request->mutex so this store
+            // happens-before the waiter's mutex-protected predicate check + park in
+            // call_function / call_function_safe_on_stack. Without this lock, the
+            // notify_one() below can fire in the window after the waiter read the predicate
+            // (false) and released request->mutex inside cv.wait but BEFORE it registered on
+            // the condvar's futex generation -> glibc drops the wakeup and the caller sleeps
+            // forever even though the call already completed. std::atomic<bool> does NOT close
+            // this race (it is a wakeup-registration ordering bug, not a visibility bug). This
+            // mirrors the already-correct mailbox-push path. Observed as a ~70-min emulator
+            // wedge after millions of recv polls across 7 cameras (completed==true, result
+            // valid, one parked waiter, zero pending condvar signal in the core dump).
+            std::lock_guard<std::mutex> lk(request->mutex);
+            request->result = result;
+            request->completed.store(true, std::memory_order_release);
+        }
+        request->cv.notify_one();  // outside the lock: avoid wake-then-immediately-block-on-mutex
     }
 }
 
@@ -2519,9 +2533,34 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
 
     {
         std::unique_lock<std::mutex> lock(request->mutex);
-        request->cv.wait(lock, [&request] {
+        // Defense-in-depth: re-check the atomic predicate on a fixed interval rather than
+        // waiting indefinitely, so a dropped completion notify self-heals within one interval
+        // (the primary cure is the synchronized store in run_request_loop). Logs once if a call
+        // ever exceeds a sanity threshold well beyond any legitimate call timeout.
+        auto wait_start = std::chrono::steady_clock::now();
+        bool warned = false;
+        while (!request->cv.wait_for(lock, std::chrono::seconds(5), [&request] {
             return request->completed.load(std::memory_order_acquire);
-        });
+        })) {
+            if (!warned) {
+                auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+                if (age >= 45) {
+                    warned = true;
+                    EMU_ALWAYS_LOG << "[EMU][WEDGE-WATCHDOG] call addr=0x" << std::hex
+                        << request->address << std::dec << " incomplete after " << age
+                        << "s (completed=" << request->completed.load()
+                        << "); re-checking predicate" << std::endl;
+                }
+            }
+        }
+        if (warned) {
+            auto total = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - wait_start).count();
+            EMU_ALWAYS_LOG << "[EMU][WEDGE-WATCHDOG] call addr=0x" << std::hex << request->address
+                << std::dec << " COMPLETED after " << total << "s (was slow, not orphaned)"
+                << std::endl;
+        }
     }
 
 #if EMU_LOGGING_ENABLED
@@ -2647,9 +2686,33 @@ uint64_t Emulator::call_function_safe_on_stack(uint64_t address, uint64_t stack_
 
     {
         std::unique_lock<std::mutex> lock(request->mutex);
-        request->cv.wait(lock, [&request] {
+        // Defense-in-depth re-checking wait (see call_function): self-heals a dropped
+        // completion notify within one interval; the primary cure is the synchronized store
+        // in run_request_loop.
+        auto wait_start = std::chrono::steady_clock::now();
+        bool warned = false;
+        while (!request->cv.wait_for(lock, std::chrono::seconds(5), [&request] {
             return request->completed.load(std::memory_order_acquire);
-        });
+        })) {
+            if (!warned) {
+                auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+                if (age >= 45) {
+                    warned = true;
+                    EMU_ALWAYS_LOG << "[EMU][WEDGE-WATCHDOG] safe call addr=0x" << std::hex
+                        << request->address << std::dec << " incomplete after " << age
+                        << "s (completed=" << request->completed.load()
+                        << "); re-checking predicate" << std::endl;
+                }
+            }
+        }
+        if (warned) {
+            auto total = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - wait_start).count();
+            EMU_ALWAYS_LOG << "[EMU][WEDGE-WATCHDOG] safe call addr=0x" << std::hex
+                << request->address << std::dec << " COMPLETED after " << total
+                << "s (was slow, not orphaned)" << std::endl;
+        }
     }
 
     return request->result;
