@@ -944,7 +944,13 @@ static std::unordered_map<uint64_t, uint64_t> g_pending_pthread_exit_values;
 static std::once_flag g_cleanup_callback_trampoline_once;
 static std::once_flag g_pthread_exit_code_once;
 static constexpr uint64_t CLEANUP_CALLBACK_TRAMPOLINE_ADDR = 0x10080400ULL;
-static constexpr uint64_t PTHREAD_EXIT_CODE_ADDR = 0x100FFF00ULL;
+// MUST NOT collide with CALL_RETURN_STUB_ADDR (emulator.cpp = HLE_BASE+0xFFF00 = 0x100FFF00),
+// the C->guest call-return trampoline. They previously shared 0x100FFF00: the first guest
+// pthread_exit's call_once wrote {mov x8,#93; svc} over the trampoline {mov x8,#0x1238; svc; ret},
+// so every subsequent normal C->guest return (LR=trampoline) executed mov x8,#93 -> the SYS_exit
+// branch -> a full-64-bit -1 returned for EVERY call -> the all-camera cascade. Relocated to a
+// free HLE slot (gap between CALL_RETURN_STUB 0xFFF00 and SAFE_CALL_TRAMPOLINE 0xFFF80).
+static constexpr uint64_t PTHREAD_EXIT_CODE_ADDR = 0x100FFF40ULL;
 
 // =============================================================================
 // QEMU-Native Barrier Infrastructure (for MTTCG)

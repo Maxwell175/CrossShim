@@ -436,6 +436,14 @@ static thread_local bool tl_call_return_hit = false;
 // given session's calls on ONE guest CPU (see pick_affinity_worker / call_function).
 static thread_local int tl_affinity_worker = -1;
 
+// Diagnostic: how this thread's most recent start() run loop exited. A C->guest call is
+// only TRUSTWORTHY (its X0 is the guest function's real return value) when start() exits via
+// the call-return trampoline ("clean_return") or end_address ("end_address"). Any other exit
+// (crash, silent break, tl_running cleared) means start() bailed mid-call and X0 is STALE —
+// call_function_internal then hands that stale X0 back as if it were the result (e.g. a stale
+// 0xffffffff surfaces to the C# layer as GetSessionId=-1). Set at every start() exit point.
+static thread_local const char* tl_start_exit_reason = "none";
+
 // CRITICAL FIX: Mutex for HLE handler serialization
 // This provides the same synchronization that verbose logging provides
 // (via EMU_LOG's mutex) without the performance overhead of actual logging.
@@ -723,10 +731,33 @@ static libafl_syshook_ret pre_syscall_hook(
         //    thread running -> it returns from the no-return pthread_exit and runs off the end
         //    of its caller into adjacent code -> SIGSEGV in code_gen_buffer (the original crash).
         if (tl_running) {
+            // EXITDIAG: this is the cascade source. A guest SYS_exit while a C->guest call runs on
+            // a worker ends the call with a full-64-bit -1 (skip_retval below). Log WHERE the guest
+            // is exiting from (PC/LR/exit-code) so we can tell a legit pthread_exit from a
+            // corrupted/mis-attributed one. fprintf = always visible.
+            {
+                static std::atomic<uint64_t> exitcnt{0};
+                uint64_t c = exitcnt.fetch_add(1, std::memory_order_relaxed);
+                if (c < 64 || (c % 1000) == 0) {
+                    fprintf(stderr, "[EXITDIAG] SYS_exit on worker tl_worker=%d guest PC=0x%lx LR=0x%lx "
+                            "exitcode=0x%lx (#%lu) -> call returns -1\n",
+                            tl_worker_id,
+                            (unsigned long)qemu::read_reg(hook_cpu, qemu::REG_PC),
+                            (unsigned long)qemu::read_reg(hook_cpu, qemu::REG_LR),
+                            (unsigned long)arg0, (unsigned long)c);
+                }
+            }
             tl_call_return_hit = true;
             libafl_qemu_trigger_breakpoint(hook_cpu);
             ret.tag = LIBAFL_SYSHOOK_SKIP;
-            ret.syshook_skip_retval = static_cast<uint64_t>(-1);
+            // Return the guest's X0 (already in arg0), NOT a hardcoded full-64-bit -1. If this
+            // branch ever fires for what is really a normal C->guest return (the historical cause:
+            // the call-return trampoline got mis-dispatched as SYS_exit), X0 already holds the
+            // function's true return value, so handing it back avoids poisoning every call with -1
+            // (the all-camera cascade). For a genuinely terminal worker pthread_exit this is the
+            // exit code — as good as -1 and still SIGSEGV-safe (still breakpoint+SKIP, no native
+            // unwind). EXITDIAG above still logs each occurrence so the root (if any) stays visible.
+            ret.syshook_skip_retval = qemu::read_reg(hook_cpu, qemu::REG_X0);
             return ret;
         }
         notify_thread_exit(hook_sp, static_cast<uint64_t>(arg0), true);
@@ -1755,6 +1786,7 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
     // Main execution loop - handles HLE breakpoints
     // No iteration limit - the periodic block yield provides safety
     int loop_count = 0;
+    tl_start_exit_reason = "incomplete";  // overwritten by a clean exit below
     while (tl_running) {  // Thread-local: only this thread's state affects its loop
         // Debug: dump registers before run (reduced verbosity)
         if (loop_count < 3) {
@@ -1776,6 +1808,7 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
         // identifies exactly this thread's call returning, with no global state.
         if (tl_call_return_hit) {
             tl_call_return_hit = false;
+            tl_start_exit_reason = "clean_return";
             break;
         }
 
@@ -1880,6 +1913,7 @@ bool Emulator::start(uint64_t address, uint64_t end_address) {
         if (end_address != 0 && current_pc == end_address) {
             uint64_t x0 = qemu::read_reg(cur_cpu, qemu::REG_X0);
             uint64_t lr = qemu::read_reg(cur_cpu, qemu::REG_LR);
+            tl_start_exit_reason = "end_address";
             EMU_LOG_VERBOSE << "[EMU] HIT END ADDRESS 0x" << std::hex << end_address
                       << " X0=0x" << x0 << " LR=0x" << lr
                       << " after " << std::dec << loop_count << " iterations" << std::endl;
@@ -2971,6 +3005,36 @@ uint64_t Emulator::call_function_internal_impl(uint64_t address, const std::vect
     call_depth--;
     uint64_t call_result = qemu::read_reg(cpu, qemu::REG_X0);
 
+    // RESDIAG (fprintf = always visible): the storm hands back call_result==full-64-bit -1, which
+    // the guest (32-bit int return) cannot produce. Capture the mechanism: success, how start()
+    // exited, the cpu we read X0 from vs the current cpu, and X0 read from BOTH — if they differ,
+    // the result read is off the wrong vCPU (MTTCG cross-cpu read); if equal & full -1, the guest
+    // truly left X0 stale. Logged only for the pathological full -1 to avoid noise.
+    if (call_result == static_cast<uint64_t>(-1)) {
+        CPUState* now_cpu = libafl_qemu_current_cpu();
+        uint64_t x0_now = now_cpu ? qemu::read_reg(now_cpu, qemu::REG_X0) : 0xBADBAD;
+        int now_idx = now_cpu ? libafl_qemu_cpu_index(now_cpu) : -1;
+        int cpu_idx = libafl_qemu_cpu_index(cpu);
+        fprintf(stderr, "[RESDIAG] addr=0x%lx success=%d exit=%s tl_worker=%d cpu=%p(idx%d) "
+                "cur=%p(idx%d) X0_cpu=0x%lx X0_cur=0x%lx\n",
+                (unsigned long)address, (int)success, tl_start_exit_reason, tl_worker_id,
+                (void*)cpu, cpu_idx, (void*)now_cpu, now_idx,
+                (unsigned long)call_result, (unsigned long)x0_now);
+    }
+
+    // Diagnostic: a C->guest call's X0 is only the real guest return value when start() exited
+    // via the call-return trampoline or end_address. Any other exit means start() bailed mid-call
+    // and call_result (X0) is STALE — yet it is handed back as the result, surfacing e.g. as a
+    // spurious GetSessionId=-1 (stale 0xffffffff) at the C# layer. The only other trace (the
+    // run-loop "Breaking loop" line) is a release-suppressed EMU_LOG, so make this VISIBLE.
+    if (std::strcmp(tl_start_exit_reason, "clean_return") != 0 &&
+        std::strcmp(tl_start_exit_reason, "end_address") != 0) {
+        EMU_ALWAYS_LOG << "[EMU][CALLDIAG] guest call @0x" << std::hex << address
+                       << " exited start() abnormally (" << tl_start_exit_reason
+                       << "); returning STALE X0=0x" << call_result << std::dec
+                       << " depth=" << call_depth << std::endl;
+    }
+
     // Log key register values AFTER the call for debugging
     if (is_safe && call_depth >= 1) {
         uint64_t x0_after = qemu::read_reg(cpu, qemu::REG_X0);
@@ -3193,6 +3257,14 @@ uint64_t Emulator::get_symbol(const std::string& name) const {
         return it->second;
     }
 
+    // Diagnostic: a failed symbol lookup is the wrapper's ONLY source of a -1 return (e.g.
+    // GetSessionId=-1). It should never happen for a loaded export. Log who/what failed:
+    // emu=this distinguishes a phantom/unloaded Emulator instance from the loaded one;
+    // modules/globals sizes reveal an empty (unloaded) table vs a present-but-missed symbol.
+    EMU_ALWAYS_LOG << "[EMU][SYMDIAG] get_symbol(\"" << name << "\") -> 0 (NOT FOUND)"
+                   << " emu=" << (const void*)this
+                   << " modules=" << modules_.size()
+                   << " globals=" << global_symbols_.size() << std::endl;
     return 0;
 }
 
