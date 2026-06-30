@@ -55,7 +55,7 @@ int g_next_fd = 100;
 // g_file_map/g_next_fd shared with hle_io.cpp. HLE handlers run concurrently on multiple
 // guest (MTTCG) threads with NO global serialization (see emulator.cpp pre_syscall_hook
 // "each handler must be internally thread-safe"), so without this, concurrent
-// fopen/fclose/fread from different camera sessions race on these unordered_maps -> torn
+// fopen/fclose/fread from different guest sessions race on these unordered_maps -> torn
 // buckets / use-after-free / double-free -> heap corruption. Recursive so memstream and
 // funopen cookie callbacks, which re-enter file handlers on the SAME thread, don't
 // self-deadlock. Held only across file ops (not the hot video path), so contention is

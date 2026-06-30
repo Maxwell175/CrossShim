@@ -100,8 +100,8 @@ static int g_main_thread_sched_priority{0};
 // Thread-local current thread ID
 static thread_local uint64_t tl_current_thread_id = 0;
 
-// Runtime lock/cond tracing (CROSSSHIM_LOCK_TRACE=1) to diagnose the multi-camera
-// concurrency deadlock: emits the mutex wait-for graph + cond wait/signal edges.
+// Runtime lock/cond tracing (CROSSSHIM_LOCK_TRACE=1) to diagnose concurrency deadlocks:
+// emits the mutex wait-for graph + cond wait/signal edges.
 static const bool g_lock_trace = [] {
     const char* e = std::getenv("CROSSSHIM_LOCK_TRACE");
     return e && e[0] == '1';
@@ -948,7 +948,7 @@ static constexpr uint64_t CLEANUP_CALLBACK_TRAMPOLINE_ADDR = 0x10080400ULL;
 // the C->guest call-return trampoline. They previously shared 0x100FFF00: the first guest
 // pthread_exit's call_once wrote {mov x8,#93; svc} over the trampoline {mov x8,#0x1238; svc; ret},
 // so every subsequent normal C->guest return (LR=trampoline) executed mov x8,#93 -> the SYS_exit
-// branch -> a full-64-bit -1 returned for EVERY call -> the all-camera cascade. Relocated to a
+// branch -> a full-64-bit -1 returned for EVERY call -> a process-wide cascade. Relocated to a
 // free HLE slot (gap between CALL_RETURN_STUB 0xFFF00 and SAFE_CALL_TRAMPOLINE 0xFFF80).
 static constexpr uint64_t PTHREAD_EXIT_CODE_ADDR = 0x100FFF40ULL;
 
@@ -1069,7 +1069,7 @@ static constexpr uint64_t GUEST_PTHREAD_MUTEXATTR_PROTOCOL_SHIFT = 16;
 //   slot k = SAFE_CALL_STACK_BASE_GUEST + k * SAFE_CALL_STACK_SIZE_GUEST
 // spanning 0xA0000000 up to GLOBAL_DATA_BASE (0xB0000000). The original check covered only
 // slot 0, so every worker's C->guest calls resolved to the SAME synthetic thread id (1) and
-// collided on mutex ownership / TLS — deadlocking recursive locks across cameras.
+// collided on mutex ownership / TLS — deadlocking recursive locks across concurrent callers.
 static constexpr uint64_t SAFE_CALL_ARENA_END_GUEST = 0xB0000000ULL;
 // Synthetic guest-thread-id base for pool-worker safe-call contexts. Must be disjoint from
 // real guest thread ids (1 = main; 0x1000+index = cloned threads).
@@ -1149,7 +1149,7 @@ static uint64_t get_current_guest_pthread_id(Emulator& emu) {
     if (is_safe_call_stack_sp(sp)) {
         // Each pool worker owns its own safe-call slot. Slot 0 (main emulator thread) keeps
         // the legacy id 1; pool workers 1..N get a STABLE id UNIQUE per slot so concurrent
-        // C->guest calls from different cameras never collide on mutex ownership.
+        // C->guest calls from different callers never collide on mutex ownership.
         uint64_t slot = safe_call_slot_from_sp(sp);
         if (slot == 0) {
             return (tl_current_thread_id == 0) ? 1 : tl_current_thread_id;
@@ -1171,10 +1171,10 @@ static uint64_t get_current_sync_thread_id(Emulator& emu) {
     (void)emu;
     // Mutex/cond/rwlock ownership MUST track the HOST thread that actually owns the
     // underlying host recursive_timed_mutex — unlocking it from a DIFFERENT host thread is
-    // undefined behavior. Guest-stack-derived ids collide for TUTK threads with custom
+    // undefined behavior. Guest-stack-derived ids collide for guest threads with custom
     // (heap) stacks (get_thread_id_from_sp -> 0 -> id 1), so multiple host threads shared
     // owner id 1 and unlocked each other's mutexes -> recursive_timed_mutex corruption ->
-    // multi-camera deadlock. Each guest thread (and each pool worker) runs on exactly ONE
+    // a concurrency deadlock. Each guest thread (and each pool worker) runs on exactly ONE
     // host thread, so a per-host-thread id is both unique AND matches host-mutex ownership.
     static thread_local uint64_t host_sync_id = 0;
     if (host_sync_id == 0) {
@@ -1412,7 +1412,7 @@ static uint64_t get_current_tls_thread_id(Emulator& emu) {
     uint64_t sp = get_reg(emu, UC_ARM64_REG_SP);
     if (is_safe_call_stack_sp(sp)) {
         // Per-worker TLS namespace: slot 0 (main) keeps the legacy id 0; pool workers 1..N
-        // get a unique id so each camera's pthread TLS values are isolated, not shared.
+        // get a unique id so each caller's pthread TLS values are isolated, not shared.
         uint64_t slot = safe_call_slot_from_sp(sp);
         if (slot == 0) {
             if (tl_current_thread_id == 0 || tl_current_thread_id == 1) {
@@ -1649,10 +1649,10 @@ static std::atomic<uint64_t> g_next_tls_addr{QEMU_THREAD_TLS_BASE};
 
 // Freelists of exited threads' region base addresses (the raw `addr` the bump allocator
 // produced, NOT the returned stack_top/tls_base). Recycling these is what bounds the
-// arenas: without it every camera reconnect permanently consumes a 1MB stack slot and
+// arenas: without it every guest thread creation permanently consumes a 1MB stack slot and
 // the 0x90000000..0xA0000000 arena exhausts after ~256 thread creations, which under
-// sustained multi-camera reconnect churn manifests as periodic crashes / cameras that
-// can no longer reconnect (AV_ER_FAIL_CREATE_THREAD). The region memory stays mapped
+// sustained thread-creation churn manifests as periodic crashes or failed thread creation.
+// The region memory stays mapped
 // after a thread exits, so a recycled region is reused WITHOUT re-mapping.
 static std::mutex g_thread_arena_mutex;
 static std::vector<uint64_t> g_free_stack_region_bases;

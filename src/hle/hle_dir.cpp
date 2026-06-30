@@ -80,7 +80,7 @@ static std::unordered_map<FTS*, FtsSession> g_fts_sessions;
 // Recursive lock guarding the directory tables above (g_dir_handles, g_next_dir_handle,
 // g_glob_guest_allocations, g_fts_sessions). HLE handlers run concurrently on MTTCG guest
 // threads with no global serialization, so concurrent opendir/readdir/closedir/glob/fts
-// across camera sessions would corrupt these maps. Recursive because scandir comparators
+// across guest sessions would corrupt these maps. Recursive because scandir comparators
 // and ftw/nftw/glob callbacks re-enter dir handlers (via call_function_safe) on the same
 // thread. (The per-walk ftw/glob contexts are thread_local and need no locking.)
 static std::recursive_mutex g_dir_tables_mutex;

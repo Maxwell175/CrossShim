@@ -279,10 +279,10 @@ private:
     std::condition_variable request_cv_;
 
     // Per-worker mailboxes for sticky affinity routing. Each calling host thread is
-    // pinned to ONE worker vCPU so a given session's C->guest calls (avRecvFrameData,
-    // etc.) always execute on the SAME guest thread/CPU. Bouncing them across CPUs
-    // corrupts TUTK's per-thread receive/reassembly state (deterministic stall after a
-    // few frames). Index 0 = main emulator thread (bootstrap + spawn); 1..vcpu_worker_count_
+    // pinned to ONE worker vCPU so a given caller's C->guest calls always execute on the
+    // SAME guest thread/CPU. Bouncing them across CPUs corrupts guest libraries that keep
+    // per-thread state (e.g. receive/reassembly buffers), causing deterministic stalls.
+    // Index 0 = main emulator thread (bootstrap + spawn); 1..vcpu_worker_count_
     // = pool workers, which are the affinity targets. Sized once in the constructor.
     struct WorkerMailbox {
         std::queue<std::shared_ptr<FunctionRequest>> queue;
@@ -296,8 +296,8 @@ private:
 
     // --- Parallel vCPU worker pool ---------------------------------------------
     // Additional worker host threads, each owning its own cloned guest vCPU, that
-    // consume request_queue_ concurrently so C->guest calls (avRecvFrameData2 reads,
-    // etc.) execute in PARALLEL across host cores instead of serializing on the single
+    // consume request_queue_ concurrently so C->guest calls execute in PARALLEL across
+    // host cores instead of serializing on the single
     // emulator_thread_/CPU0. Worker vCPUs are minted via the guest clone() path and
     // their host threads are diverted into worker_vcpu_loop() by a libafl new-thread
     // hook (see vcpu_new_thread_hook_cb). usermode linux-user has no real BQL, so these
@@ -307,7 +307,7 @@ private:
     std::vector<CPUState*> worker_cpus_;
     // Spawn coordination: each freshly-cloned worker host thread self-binds its OWN vCPU
     // (env_cpu(env)) from the new-thread hook and is identified by the clone-stub PC, so
-    // concurrent TUTK thread creation can't mis-assign vCPUs.
+    // concurrent guest thread creation can't mis-assign vCPUs.
     std::mutex worker_handshake_mutex_;
     std::condition_variable worker_handshake_cv_;
     bool spawning_workers_ = false;
@@ -323,7 +323,7 @@ private:
     // Exception firewall: catches any C++ exception escaping guest execution / HLE and
     // converts it to a failed call (-1) instead of letting it cross the P/Invoke boundary
     // or escape the worker thread (which would std::terminate the whole process and every
-    // camera). All call paths (worker thread, direct, safe) funnel through here.
+    // session). All call paths (worker thread, direct, safe) funnel through here.
     uint64_t call_function_internal(uint64_t address, const std::vector<uint64_t>& args, bool is_safe,
                                     uint64_t safe_stack_top = 0);
     uint64_t call_function_internal_impl(uint64_t address, const std::vector<uint64_t>& args, bool is_safe,

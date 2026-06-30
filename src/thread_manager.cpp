@@ -1173,9 +1173,9 @@ int ThreadManager::pthread_create(uint64_t thread_ptr, uint64_t attr,
         std::lock_guard<std::mutex> lock(scheduler_mutex_);
         // PRIORITY FIX: Add newly created threads to the FRONT of the runnable queue
         // This ensures they get CPU time immediately to initialize, which is critical
-        // for time-sensitive TUTK library initialization sequences.
-        // The TUTK library creates background threads that must signal ready within
-        // a short timeout, or the main thread will fail with AV_ER_TIMEOUT.
+        // for time-sensitive guest library initialization sequences. Some guest libraries
+        // create background threads that must signal ready within a short timeout, or the
+        // main thread fails.
         runnable_queue_.push_front(thread_id);
         EMU_LOG << "[THREAD] New thread " << thread_id << " added to FRONT of runnable queue for priority initialization" << std::endl;
     }
@@ -1503,10 +1503,10 @@ int ThreadManager::pthread_mutex_lock(uint64_t mutex_ptr) {
         }
 
         // Handle recursive mutex
-        // NOTE: We allow recursive locking for ALL mutex types as a workaround for
-        // libraries (like TUTK) that incorrectly use non-recursive mutexes recursively.
-        // This is technically incorrect behavior for PTHREAD_MUTEX_NORMAL, but it's
-        // necessary for compatibility with buggy libraries.
+        // NOTE: We allow recursive locking for ALL mutex types as a workaround for guest
+        // libraries that incorrectly use non-recursive mutexes recursively. This is
+        // technically incorrect behavior for PTHREAD_MUTEX_NORMAL, but it's necessary for
+        // compatibility with such libraries.
 
         // Get PC for debugging
         uint64_t pc = 0;

@@ -296,17 +296,22 @@ static const char* find_qemu_stub() {
     static std::string stub_path;
     if (!stub_path.empty()) return stub_path.c_str();
 
-    // Check common locations
+    // Explicit override for non-standard layouts (set by the embedder if needed).
+    if (const char* env = std::getenv("CROSSSHIM_QEMU_STUB")) {
+        std::ifstream f(env);
+        if (f.good()) {
+            stub_path = env;
+            return stub_path.c_str();
+        }
+    }
+
+    // Check common locations relative to the working directory / binary.
     const char* locations[] = {
-        // Relative to working directory
         "stubs/qemu_stub",
         "../stubs/qemu_stub",
         "../../stubs/qemu_stub",
-        // Relative to binary
         "../CrossShim/stubs/qemu_stub",
         "../../CrossShim/stubs/qemu_stub",
-        // Absolute path fallback
-        "/mnt/ExtraSSD/src/WyzeBridgeDotNet/CrossShim/stubs/qemu_stub",
         nullptr
     };
 
@@ -754,7 +759,7 @@ static libafl_syshook_ret pre_syscall_hook(
             // branch ever fires for what is really a normal C->guest return (the historical cause:
             // the call-return trampoline got mis-dispatched as SYS_exit), X0 already holds the
             // function's true return value, so handing it back avoids poisoning every call with -1
-            // (the all-camera cascade). For a genuinely terminal worker pthread_exit this is the
+            // (a process-wide cascade). For a genuinely terminal worker pthread_exit this is the
             // exit code — as good as -1 and still SIGSEGV-safe (still breakpoint+SKIP, no native
             // unwind). EXITDIAG above still logs each occurrence so the root (if any) stays visible.
             ret.syshook_skip_retval = qemu::read_reg(hook_cpu, qemu::REG_X0);
@@ -1177,7 +1182,7 @@ uint64_t HleManager::allocate_stub(const std::string &name) {
         uint64_t addr = next_stub_addr_;
         stub_addresses_[name] = addr;
 
-        // `usleep` is hot in the TUTK libraries and it commonly runs on MTTCG
+        // `usleep` is hot in many guest libraries and it commonly runs on MTTCG
         // worker threads. Executing the generic HLE callback keeps the guest
         // thread parked inside the syscall hook until the host sleep finishes,
         // and that return path has proven fragile under load. Route `usleep`
@@ -1303,15 +1308,15 @@ Emulator::Emulator(const EmulatorConfig &config)
       next_load_addr_(CODE_BASE),
       debug_enabled_(config.enable_debug),
       profile_enabled_(config.enable_profile) {
-    // Allow enabling profiling via env even when the embedding wrapper (tutk_wrapper)
-    // constructs the Emulator with a default config. EMU_PROFILE=1 -> periodic
+    // Allow enabling profiling via env even when the embedding wrapper constructs the
+    // Emulator with a default config. EMU_PROFILE=1 -> periodic
     // [EMU_PROFILE] per-call latency breakdown (alloc/queue/sched/exec/signal/TOTAL).
     if (const char* p = std::getenv("EMU_PROFILE")) {
         if (std::atoi(p) != 0) profile_enabled_ = true;
     }
 
     // Parallel vCPU worker pool size (extra worker threads/vCPUs beyond the main thread).
-    // ON by default so C->guest calls (camera frame reads) run in parallel across cores.
+    // ON by default so C->guest calls run in parallel across cores.
     // Override with CROSSSHIM_VCPU_WORKERS (0 = legacy single-worker behavior).
     vcpu_worker_count_ = 8;
     if (const char* w = std::getenv("CROSSSHIM_VCPU_WORKERS")) {
@@ -2190,11 +2195,11 @@ bool Emulator::on_vcpu_new_thread(::CPUArchState* env, uint32_t tid) {
     {
         std::lock_guard<std::mutex> lk(worker_handshake_mutex_);
         if (!spawning_workers_) {
-            return true;  // ordinary guest (TUTK) thread -> clone_func runs cpu_loop(env)
+            return true;  // ordinary guest thread -> clone_func runs cpu_loop(env)
         }
     }
-    // Identify OUR worker clones by where they resume (the clone stub). TUTK threads
-    // created concurrently during the spawn window resume at the thread wrapper instead.
+    // Identify OUR worker clones by where they resume (the clone stub). Ordinary guest
+    // threads created concurrently during the spawn window resume at the thread wrapper instead.
     CPUState* cpu = libafl_qemu_cpu_from_env(env);
     uint64_t pc = cpu ? qemu::read_reg(cpu, qemu::REG_PC) : 0;
     if (cpu == nullptr || pc < vcpu_worker_clone_addr_ || pc >= vcpu_worker_clone_addr_ + 0x10) {
@@ -2368,7 +2373,7 @@ void Emulator::run_request_loop() {
             // forever even though the call already completed. std::atomic<bool> does NOT close
             // this race (it is a wakeup-registration ordering bug, not a visibility bug). This
             // mirrors the already-correct mailbox-push path. Observed as a ~70-min emulator
-            // wedge after millions of recv polls across 7 cameras (completed==true, result
+            // wedge after millions of recv polls across many concurrent sessions (completed==true, result
             // valid, one parked waiter, zero pending condvar signal in the core dump).
             std::lock_guard<std::mutex> lk(request->mutex);
             request->result = result;
@@ -2441,7 +2446,7 @@ void Emulator::emulator_thread_func() {
     tl_safe_stack_base = SAFE_CALL_STACK_BASE;
 
     // Register the new-thread hook so the worker vCPUs we clone get diverted into
-    // worker_vcpu_loop() instead of running cpu_loop(). Ordinary guest (TUTK) threads
+    // worker_vcpu_loop() instead of running cpu_loop(). Ordinary guest threads
     // are untouched (the hook returns true for them).
     if (vcpu_worker_count_ > 0) {
         libafl_add_new_thread_hook(vcpu_new_thread_hook_cb, reinterpret_cast<uint64_t>(this));
@@ -2500,7 +2505,7 @@ static inline void update_max(std::atomic<uint64_t>& max_val, uint64_t val) {
 int Emulator::pick_affinity_worker() {
     if (workers_spawned_.load(std::memory_order_acquire) && vcpu_worker_count_ > 0) {
         // Diagnostic override: CROSSSHIM_PIN_WORKER=K forces every C->guest call onto
-        // worker K (no spreading). Lets us isolate "spreading across cpus breaks TUTK"
+        // worker K (no spreading). Lets us isolate "spreading across cpus breaks the guest"
         // (works when pinned) from "single worker cpu / HLE state is broken" (still stalls).
         static const int pinned = [] {
             const char* p = std::getenv("CROSSSHIM_PIN_WORKER");
@@ -2777,7 +2782,7 @@ uint64_t Emulator::call_function_internal(uint64_t address, const std::vector<ui
     // std::runtime_error from QEMU, etc.) thrown below this point would otherwise escape
     // either the worker thread (-> std::terminate) or the extern "C"/P-Invoke boundary
     // (-> undefined behavior in the .NET runtime), killing the whole process and every
-    // camera. Convert it into a failed call so only the calling session sees the error
+    // session. Convert it into a failed call so only the calling session sees the error
     // and can reconnect. (SIGSEGV is NOT a C++ exception and is handled separately.)
     try {
         return call_function_internal_impl(address, args, is_safe, safe_stack_top);
