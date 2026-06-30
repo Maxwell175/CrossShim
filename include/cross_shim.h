@@ -79,6 +79,7 @@ struct LoadedModule {
     uint64_t base_address;
     uint64_t size;
     std::unordered_map<std::string, uint64_t> exports;
+    std::unordered_map<std::string, uint64_t> local_symbols;  // .symtab fallback (e.g. local `main`)
     std::vector<uint8_t> data;
 };
 

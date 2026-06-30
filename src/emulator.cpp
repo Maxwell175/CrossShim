@@ -1601,13 +1601,24 @@ void Emulator::initialize_global_data() {
         mem_write(file_addr + 0x70, &fileno, sizeof(fileno));
     }
 
-    global_symbols_["__sF"] = sf_addr;
+    global_symbols_["__sF"] = sf_addr;  // legacy `FILE __sF[]` array (the &__sF[i] macro path)
 
-    // Also register stdin, stdout, stderr as individual symbols
-    // Some code references these directly instead of using __sF
-    global_symbols_["stdin"] = sf_addr;                    // __sF[0]
-    global_symbols_["stdout"] = sf_addr + FILE_SIZE;       // __sF[1]
-    global_symbols_["stderr"] = sf_addr + 2 * FILE_SIZE;   // __sF[2]
+    // bionic (API >= 23) declares stdin/stdout/stderr as `FILE*` POINTER VARIABLES,
+    // not the FILE structs themselves. Reading e.g. `stdout` is a double indirection:
+    // the GOT holds the address of the pointer variable, and the program derefs once
+    // to obtain the FILE*. So these symbols must resolve to pointer slots holding the
+    // FILE-struct addresses; pointing them straight at the structs makes the program
+    // read the struct's first word (_flags) as the FILE* (yielding a bogus value of 1,
+    // which breaks fileno()/fprintf on these streams). Allocate 3 pointer slots right
+    // after the FILE structs.
+    uint64_t std_ptrs_addr = sf_addr + NUM_FILES * FILE_SIZE;
+    for (int i = 0; i < 3; i++) {
+        uint64_t file_struct_addr = sf_addr + i * FILE_SIZE;
+        mem_write(std_ptrs_addr + i * 8, &file_struct_addr, 8);
+    }
+    global_symbols_["stdin"]  = std_ptrs_addr;          // &(FILE* stdin)  -> &__sF[0]
+    global_symbols_["stdout"] = std_ptrs_addr + 8;      // &(FILE* stdout) -> &__sF[1]
+    global_symbols_["stderr"] = std_ptrs_addr + 16;     // &(FILE* stderr) -> &__sF[2]
 
     // Initialize sys_signame and sys_siglist arrays
     // These are arrays of pointers to signal name/description strings
@@ -1679,6 +1690,18 @@ void Emulator::initialize_global_data() {
     mem_write(in6addr_base + 16, any_addr, 16);
     global_symbols_["in6addr_loopback"] = in6addr_base;
     global_symbols_["in6addr_any"] = in6addr_base + 16;
+
+    // environ: the `char **environ` data symbol. Programs (and allocators such as
+    // mimalloc) read environ[i] directly, so it MUST be real data, not a function
+    // stub. The symbol value is the array address; a single GOT load yields the
+    // char** value, matching the stdin/stdout/stderr convention above. Start empty
+    // (a lone NULL terminator).
+    uint64_t environ_array_addr = in6addr_base + 0x40;
+    uint64_t environ_null = 0;
+    mem_write(environ_array_addr, &environ_null, PTR_SIZE);  // environ[0] = NULL
+    global_symbols_["environ"] = environ_array_addr;
+    global_symbols_["__environ"] = environ_array_addr;
+    global_symbols_["_environ"] = environ_array_addr;
 }
 
 void Emulator::setup_hooks() {
@@ -3250,6 +3273,15 @@ uint64_t Emulator::get_symbol(const std::string& name) const {
     auto it = global_symbols_.find(name);
     if (it != global_symbols_.end()) {
         return it->second;
+    }
+
+    // Fallback: full-symtab defined symbols (e.g. a PIE's local `main`, which is not
+    // in .dynsym). Consulted after exports/globals so dynamic symbols win.
+    for (const auto& mod : modules_) {
+        auto lit = mod.local_symbols.find(name);
+        if (lit != mod.local_symbols.end()) {
+            return lit->second;
+        }
     }
 
     // Diagnostic: a failed symbol lookup is the wrapper's ONLY source of a -1 return (e.g.

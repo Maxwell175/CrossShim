@@ -99,6 +99,27 @@ std::vector<SymbolInfo> ElfLoader::get_exports() const {
     return exports;
 }
 
+std::vector<SymbolInfo> ElfLoader::get_symtab_defined_symbols() const {
+    std::vector<SymbolInfo> syms;
+    if (!binary_) return syms;
+
+    for (const auto& sym : binary_->symtab_symbols()) {
+        const std::string name = sym.name();
+        if (name.empty() || name[0] == '$') continue;  // skip ARM mapping symbols ($x/$d)
+        if (sym.value() == 0 || sym.is_imported()) continue;  // skip undefined/imported
+
+        SymbolInfo info;
+        info.name = name;
+        info.value = sym.value();
+        info.size = sym.size();
+        info.type = static_cast<uint8_t>(sym.type());
+        info.bind = static_cast<uint8_t>(sym.binding());
+        info.is_exported = false;
+        syms.push_back(info);
+    }
+    return syms;
+}
+
 std::vector<SymbolInfo> ElfLoader::get_imports() const {
     std::vector<SymbolInfo> imports;
     if (!binary_) return imports;
@@ -268,6 +289,14 @@ bool ElfLoader::load(MemoryManager& memory, uint64_t base_address, LoadedModule&
         if (!sym.name.empty() && sym.value != 0) {
             module.exports[sym.name] = base_address + sym.value - min_vaddr;
         }
+    }
+
+    // Collect full-symtab defined symbols as a lookup fallback (kept separate from
+    // exports so they never perturb cross-module import resolution). This is what
+    // makes a PIE's local `main` reachable by get_symbol().
+    for (const auto& sym : get_symtab_defined_symbols()) {
+        if (module.exports.count(sym.name)) continue;  // dynamic exports win
+        module.local_symbols[sym.name] = base_address + sym.value - min_vaddr;
     }
 
     return true;

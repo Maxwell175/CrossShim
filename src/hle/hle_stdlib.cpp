@@ -210,17 +210,9 @@ void register_hle_stdlib(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
-    // Environment variable (global)
-    hle.register_function("environ", [](Emulator& emu) {
-        // Return a pointer to an empty environ array (just NULL)
-        static uint64_t environ_ptr = 0;
-        if (environ_ptr == 0) {
-            environ_ptr = emu.memory().heap().allocate(8, 8);
-            uint64_t null = 0;
-            emu.mem_write(environ_ptr, &null, 8);
-        }
-        set_reg(emu, UC_ARM64_REG_X0, environ_ptr);
-    });
+    // NOTE: `environ` is a `char **` DATA symbol, not a function. It is provided as
+    // a global data symbol in emulator.cpp (setup_global_symbols) so that programs
+    // and allocators reading environ[i] directly get valid memory, not a code stub.
 
     // ========================================================================
     // String to number conversion
@@ -368,6 +360,18 @@ void register_hle_stdlib(HleManager& hle) {
             EMU_LOG << "[HLE-TRACE] arc4random() called (call #" << arc4random_call_count << ")" << std::endl;
         }
         set_reg(emu, UC_ARM64_REG_X0, g_rng());
+    });
+
+    // arc4random_buf - fill buffer with n random bytes (void return, no length cap)
+    hle.register_function("arc4random_buf", [](Emulator& emu) {
+        uint64_t buf = get_reg(emu, UC_ARM64_REG_X0);
+        size_t len = get_reg(emu, UC_ARM64_REG_X1);
+        if (len == 0) return;
+        std::vector<uint8_t> data(len);
+        for (size_t i = 0; i < len; i++) {
+            data[i] = g_rng() & 0xFF;
+        }
+        emu.mem_write(buf, data.data(), len);
     });
 
     // getentropy - fill buffer with random bytes

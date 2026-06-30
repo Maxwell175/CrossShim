@@ -69,7 +69,12 @@ public:
     
     // Get exported symbols
     std::vector<SymbolInfo> get_exports() const;
-    
+
+    // Get defined symbols from the full symbol table (.symtab), including ones
+    // with LOCAL binding (e.g. a PIE's `main` compiled with hidden visibility).
+    // These are not in .dynsym, so they would otherwise be unreachable.
+    std::vector<SymbolInfo> get_symtab_defined_symbols() const;
+
     // Get imported symbols
     std::vector<SymbolInfo> get_imports() const;
     
