@@ -889,7 +889,8 @@ int sleep_with_timer_processing(Emulator& emu, int clock_id, int flags,
         return EINVAL;
     }
 
-    if (flags != 0) {
+    constexpr int kTimerAbstime = 1;  // TIMER_ABSTIME
+    if (flags != 0 && flags != kTimerAbstime) {
         return EINVAL;
     }
 
@@ -897,7 +898,13 @@ int sleep_with_timer_processing(Emulator& emu, int clock_id, int flags,
     if (start_ns < 0) {
         return EINVAL;
     }
-    int64_t deadline_ns = start_ns + timespec_to_ns(req);
+    // TIMER_ABSTIME: `req` is an absolute deadline in `clock_id`'s timescale (used by
+    // CPython's time.sleep via clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)).
+    // Otherwise it is a relative duration. An already-past absolute deadline returns
+    // immediately (the loop below exits at once).
+    int64_t deadline_ns = (flags == kTimerAbstime)
+                              ? timespec_to_ns(req)
+                              : start_ns + timespec_to_ns(req);
 
     while (true) {
         process_due_timers(emu);
@@ -919,7 +926,13 @@ int sleep_with_timer_processing(Emulator& emu, int clock_id, int flags,
         if (chunk_ns <= 0) {
             chunk_ns = 1000;
         }
+        // Step out of QEMU's CPU exec/exclusive state while blocking so this sleeping
+        // vCPU doesn't stall tb_flush / thread creation (the reason usleep was previously
+        // routed natively). Timer delivery (process_due_timers above) runs guest code and
+        // stays inside the exec state; only the host sleep is done suspended.
+        emu.cpu_exec_suspend();
         std::this_thread::sleep_for(std::chrono::nanoseconds(chunk_ns));
+        emu.cpu_exec_resume();
     }
 
     if (rem_out != nullptr) {

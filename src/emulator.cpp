@@ -1180,40 +1180,12 @@ std::vector<std::string> HleManager::get_registered_functions() const {
 }
 
 uint64_t HleManager::allocate_stub(const std::string &name) {
-    if (name == "usleep") {
-        uint64_t addr = next_stub_addr_;
-        stub_addresses_[name] = addr;
-
-        // `usleep` is hot in many guest libraries and it commonly runs on MTTCG
-        // worker threads. Executing the generic HLE callback keeps the guest
-        // thread parked inside the syscall hook until the host sleep finishes,
-        // and that return path has proven fragile under load. Route `usleep`
-        // through a tiny guest-side nanosleep wrapper instead so QEMU owns the
-        // blocking syscall natively on every guest thread.
-        static constexpr uint32_t code[] = {
-            0xD2884809,  // mov  x9, #0x4240
-            0xF2A001E9,  // movk x9, #0xf, lsl #16        ; x9 = 1000000
-            0x9AC9080A,  // udiv x10, x0, x9              ; seconds
-            0x9B09814B,  // msub x11, x10, x9, x0         ; remainder usec
-            0xD2807D0C,  // mov  x12, #1000
-            0x9B0C7D6B,  // mul  x11, x11, x12            ; nanoseconds
-            0xD10043FF,  // sub  sp, sp, #16
-            0xA9002FEA,  // stp  x10, x11, [sp]           ; timespec
-            0x910003E0,  // mov  x0, sp
-            0xAA1F03E1,  // mov  x1, xzr
-            0xD2800CA8,  // mov  x8, #101                 ; SYS_nanosleep
-            0xD4000001,  // svc  #0
-            0x910043FF,  // add  sp, sp, #16
-            0xD65F03C0,  // ret
-        };
-
-        next_stub_addr_ += sizeof(code);
-
-        bool wrote = memory_.write(addr, code, sizeof(code));
-        EMU_LOG << "[HLE_STUB] Writing native usleep stub at 0x" << std::hex << addr
-                << " write_success=" << wrote << std::dec << std::endl;
-        return addr;
-    }
+    // NOTE: usleep was previously routed through a native guest-side nanosleep wrapper
+    // because the HLE sleep handler parked the vCPU inside the syscall hook (holding the
+    // exec/exclusive state) and stalled thread creation. The HLE sleep path now steps out
+    // of that state while blocking (Emulator::cpu_exec_suspend/resume), so usleep can use
+    // the normal HLE stub again — which makes it timer-aware (delivers POSIX timer signals
+    // that expire during the sleep) instead of an opaque native block.
 
     uint64_t addr = next_stub_addr_;
     stub_addresses_[name] = addr;
@@ -2718,6 +2690,30 @@ uint64_t Emulator::call_function(uint64_t address, const std::vector<uint64_t>& 
 
 uint64_t Emulator::call_function_safe(uint64_t address, const std::vector<uint64_t>& args) {
     return call_function_safe_on_stack(address, 0, args);
+}
+
+// QEMU CPU execution-state primitives (exported by the QEMU library). cpu_exec_end clears
+// cpu->running and releases any pending exclusive waiter; cpu_exec_start re-enters (waiting
+// out an in-progress exclusive section). They let a vCPU that is about to block in an HLE
+// handler step out of the exclusive set so tb_flush / thread creation don't stall on it.
+extern "C" void cpu_exec_start(CPUState* cpu);
+extern "C" void cpu_exec_end(CPUState* cpu);
+
+namespace { thread_local CPUState* tl_suspended_cpu = nullptr; }
+
+void Emulator::cpu_exec_suspend() {
+    CPUState* cpu = libafl_qemu_current_cpu();
+    tl_suspended_cpu = cpu;
+    if (cpu != nullptr) {
+        cpu_exec_end(cpu);
+    }
+}
+
+void Emulator::cpu_exec_resume() {
+    if (tl_suspended_cpu != nullptr) {
+        cpu_exec_start(tl_suspended_cpu);
+        tl_suspended_cpu = nullptr;
+    }
 }
 
 uint64_t Emulator::call_function_safe_on_stack(uint64_t address, uint64_t stack_top,

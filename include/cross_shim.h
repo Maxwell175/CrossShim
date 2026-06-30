@@ -144,6 +144,12 @@ public:
     uint64_t call_function_safe(uint64_t address, const std::vector<uint64_t>& args = {});
     uint64_t call_function_safe_on_stack(uint64_t address, uint64_t stack_top,
                                          const std::vector<uint64_t>& args = {});
+    // Temporarily leave / rejoin QEMU's CPU execution state around a blocking host
+    // operation inside an HLE handler (e.g. a sleep). Leaving clears cpu->running so a
+    // sleeping vCPU does not stall start_exclusive (tb_flush) / thread creation. Must be
+    // balanced (suspend before the block, resume after) on the same worker thread.
+    void cpu_exec_suspend();
+    void cpu_exec_resume();
     // Direct call from current thread (must be same thread as QEMU init)
     uint64_t call_function_direct(uint64_t address, const std::vector<uint64_t>& args = {});
     // Check if the last call_function succeeded
