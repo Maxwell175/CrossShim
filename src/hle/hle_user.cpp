@@ -316,11 +316,8 @@ void register_hle_user(HleManager &hle) {
     uint64_t result = 0;
     switch (type) {
     case 3: { // AT_PHDR
-      if (!emu.modules().empty()) {
-        result = emu.modules().front().base_address + 0x40;
-      } else {
-        result = 0x400040;
-      }
+      uint64_t base = emu.main_module_base();  // locked accessor (safe vs runtime dlopen)
+      result = base ? base + 0x40 : 0x400040;
       break;
     }
     case 4: // AT_PHENT
@@ -333,11 +330,8 @@ void register_hle_user(HleManager &hle) {
       result = 4096;
       break;
     case 9: { // AT_ENTRY
-      if (!emu.modules().empty()) {
-        result = emu.modules().front().base_address;
-      } else {
-        result = 0x400000;
-      }
+      uint64_t base = emu.main_module_base();  // locked accessor (safe vs runtime dlopen)
+      result = base ? base : 0x400000;
       break;
     }
     case 11: // AT_UID

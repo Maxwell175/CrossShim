@@ -20,6 +20,7 @@
 #include "thread_manager.h"
 #include "tls_manager.h"
 #include "bionic_types.h"
+#include "hle_path_translation.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <shared_mutex>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -1314,6 +1316,11 @@ Emulator::Emulator(const EmulatorConfig &config)
     if (const char* p = std::getenv("EMU_PROFILE")) {
         if (std::atoi(p) != 0) profile_enabled_ = true;
     }
+
+    // Reserve module storage so push_back() (including runtime dlopen) never reallocates
+    // and moves elements. Concurrent readers of modules() (thread setup, auxv) keep stable
+    // references even while a dlopen on another vCPU appends a module.
+    modules_.reserve(256);
 
     // Parallel vCPU worker pool size (extra worker threads/vCPUs beyond the main thread).
     // ON by default so C->guest calls run in parallel across cores.
@@ -3118,6 +3125,12 @@ bool Emulator::load_library(const std::string& path) {
         return false;
     }
 
+    // Remember the main binary's path so dlopen() can search its directory for
+    // bare sonames (the first load is the main program).
+    if (first_binary_path_.empty()) {
+        first_binary_path_ = path;
+    }
+
     std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
                                std::istreambuf_iterator<char>());
 
@@ -3151,70 +3164,17 @@ bool Emulator::load_library(const std::string& name, const std::vector<uint8_t>&
     next_load_addr_ = module.base_address + module.size;
     next_load_addr_ = (next_load_addr_ + 0xFFFFF) & ~0xFFFFFULL;  // Align to 1MB
 
-    // Process relocations using a symbol resolver
+    // The first module loaded is the main binary: record its host path so dlopen() can
+    // search its directory for bare sonames. (Deterministic by load order, not basename.)
+    if (modules_.empty() && !first_binary_path_.empty()) {
+        module.path = first_binary_path_;
+    }
+    // Intern a guest-resident name string so dladdr() can return a valid dli_fname.
+    module.guest_name_str = intern_guest_string(module.path.empty() ? name : module.path);
+
+    // Process relocations using the shared import resolver (HLE -> globals -> module exports).
     auto resolver = [this](const std::string& sym_name) -> uint64_t {
-        // Strip version suffix (e.g., "calloc@LIBC" -> "calloc")
-        std::string base_name = sym_name;
-        size_t at_pos = sym_name.find('@');
-        if (at_pos != std::string::npos) {
-            base_name = sym_name.substr(0, at_pos);
-        }
-
-        // First check HLE hooks (try both full name and base name)
-        uint64_t addr = hle_->get_stub_address(sym_name);
-        if (addr != 0) {
-            if (base_name == "calloc" || base_name == "epoll_create" || base_name == "memset" ||
-                base_name == "pthread_create" || base_name == "strtod" || base_name == "strtof" ||
-                base_name == "difftime") {
-                EMU_LOG << "[RELOC] Resolved " << sym_name << " to HLE at 0x"
-                          << std::hex << addr << std::dec << std::endl;
-            }
-            return addr;
-        }
-        if (base_name != sym_name) {
-            addr = hle_->get_stub_address(base_name);
-            if (addr != 0) {
-                if (base_name == "calloc" || base_name == "epoll_create" || base_name == "memset" ||
-                    base_name == "pthread_create" || base_name == "strtod" || base_name == "strtof" ||
-                    base_name == "difftime") {
-                    EMU_LOG << "[RELOC] Resolved " << sym_name << " via base_name " << base_name
-                              << " to HLE at 0x" << std::hex << addr << std::dec << std::endl;
-                }
-                return addr;
-            }
-        }
-
-        // Then check global symbols
-        auto it = global_symbols_.find(sym_name);
-        if (it != global_symbols_.end()) {
-            EMU_LOG << "[RELOC] Resolved global symbol " << sym_name << " to 0x"
-                      << std::hex << it->second << std::dec << std::endl;
-            return it->second;
-        }
-        if (base_name != sym_name) {
-            it = global_symbols_.find(base_name);
-            if (it != global_symbols_.end()) {
-                EMU_LOG << "[RELOC] Resolved global symbol " << base_name << " (from " << sym_name << ") to 0x"
-                          << std::hex << it->second << std::dec << std::endl;
-                return it->second;
-            }
-        }
-
-        // Finally check exports from already-loaded libraries
-        for (const auto& mod : modules_) {
-            auto exp_it = mod.exports.find(sym_name);
-            if (exp_it != mod.exports.end()) {
-                return exp_it->second;
-            }
-            if (base_name != sym_name) {
-                exp_it = mod.exports.find(base_name);
-                if (exp_it != mod.exports.end()) {
-                    return exp_it->second;
-                }
-            }
-        }
-
-        return 0;
+        return resolve_import(sym_name);
     };
     if (!relocator_->process_relocations(*loader_, module.base_address, resolver)) {
         EMU_LOG << "[EMU] Failed to process relocations: " << name << std::endl;
@@ -3262,7 +3222,7 @@ void Emulator::call_init_functions() {
     pending_init_funcs_.clear();
 }
 
-uint64_t Emulator::get_symbol(const std::string& name) const {
+uint64_t Emulator::get_symbol_nolock(const std::string& name) const {
     for (const auto& mod : modules_) {
         auto it = mod.exports.find(name);
         if (it != mod.exports.end()) {
@@ -3283,6 +3243,15 @@ uint64_t Emulator::get_symbol(const std::string& name) const {
             return lit->second;
         }
     }
+    return 0;
+}
+
+uint64_t Emulator::get_symbol(const std::string& name) const {
+    std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+    uint64_t addr = get_symbol_nolock(name);
+    if (addr != 0) {
+        return addr;
+    }
 
     // Diagnostic: a failed symbol lookup is the wrapper's ONLY source of a -1 return (e.g.
     // GetSessionId=-1). It should never happen for a loaded export. Log who/what failed:
@@ -3295,7 +3264,9 @@ uint64_t Emulator::get_symbol(const std::string& name) const {
     return 0;
 }
 
-uint64_t Emulator::get_symbol(const std::string& module, const std::string& name) const {
+uint64_t Emulator::get_symbol_nolock(const std::string& module, const std::string& name) const {
+    // Module-scoped lookup returns only EXPORTED symbols (matches the historical
+    // behavior and the dlsym contract; local/.symtab symbols are not exposed here).
     for (const auto& mod : modules_) {
         if (mod.name == module) {
             auto it = mod.exports.find(name);
@@ -3306,6 +3277,336 @@ uint64_t Emulator::get_symbol(const std::string& module, const std::string& name
         }
     }
     return 0;
+}
+
+uint64_t Emulator::get_symbol(const std::string& module, const std::string& name) const {
+    std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+    return get_symbol_nolock(module, name);
+}
+
+// ===========================================================================
+// Dynamic loading (dlopen/dlsym/dlclose/dlerror/dladdr backends)
+// ===========================================================================
+
+// Per-thread last error, matching bionic's thread-local dlerror() semantics.
+static thread_local std::string tl_dl_error;
+
+uint64_t Emulator::resolve_import(const std::string& sym_name) const {
+    // Strip version suffix (e.g., "calloc@LIBC" -> "calloc").
+    std::string base_name = sym_name;
+    size_t at_pos = sym_name.find('@');
+    if (at_pos != std::string::npos) {
+        base_name = sym_name.substr(0, at_pos);
+    }
+
+    // 1. HLE stubs first, so a loaded .so re-exporting a libc name cannot shadow HLE.
+    uint64_t addr = hle_->get_stub_address(sym_name);
+    if (addr != 0) return addr;
+    if (base_name != sym_name) {
+        addr = hle_->get_stub_address(base_name);
+        if (addr != 0) return addr;
+    }
+
+    // 2. Emulator-synthesized global data symbols (__sF, environ, stdout, ...).
+    auto it = global_symbols_.find(sym_name);
+    if (it != global_symbols_.end()) return it->second;
+    if (base_name != sym_name) {
+        it = global_symbols_.find(base_name);
+        if (it != global_symbols_.end()) return it->second;
+    }
+
+    // 3. Exports of already-loaded modules (lets a dlopen'd .so bind against them).
+    for (const auto& mod : modules_) {
+        auto exp_it = mod.exports.find(sym_name);
+        if (exp_it != mod.exports.end()) return exp_it->second;
+        if (base_name != sym_name) {
+            exp_it = mod.exports.find(base_name);
+            if (exp_it != mod.exports.end()) return exp_it->second;
+        }
+    }
+    return 0;
+}
+
+const LoadedModule* Emulator::find_module_by_base(uint64_t base) const {
+    for (const auto& mod : modules_) {
+        if (mod.base_address == base) return &mod;
+    }
+    return nullptr;
+}
+
+std::string Emulator::resolve_library_path(const std::string& guest_path) const {
+    auto readable = [](const std::string& p) {
+        return !p.empty() && ::access(p.c_str(), R_OK) == 0;
+    };
+
+    // A path with a slash is explicit: translate guest->host then try as-is.
+    if (guest_path.find('/') != std::string::npos) {
+        std::string translated = translate_guest_host_path(guest_path);
+        if (readable(translated)) return translated;
+        if (readable(guest_path)) return guest_path;
+        return "";
+    }
+
+    // Bare soname: search a list of directories.
+    std::vector<std::string> dirs;
+    auto add_dir_of = [&dirs](const std::string& file) {
+        if (file.empty()) return;
+        size_t s = file.find_last_of("/\\");
+        dirs.push_back(s == std::string::npos ? std::string(".") : file.substr(0, s));
+    };
+    add_dir_of(first_binary_path_);                 // main binary's directory
+    {
+        std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+        for (const auto& mod : modules_) add_dir_of(mod.path);  // loaded modules' dirs
+    }
+    if (const char* llp = ::getenv("LD_LIBRARY_PATH")) {       // host LD_LIBRARY_PATH
+        std::string s(llp), cur;
+        for (char c : s) {
+            if (c == ':') { if (!cur.empty()) dirs.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) dirs.push_back(cur);
+    }
+    dirs.push_back(".");                                        // host cwd
+
+    for (const auto& d : dirs) {
+        std::string cand = d + "/" + guest_path;
+        if (readable(cand)) return cand;
+    }
+    return "";
+}
+
+bool Emulator::load_module_locked(const std::string& name, const std::string& host_path,
+                                  const std::vector<uint8_t>& data,
+                                  uint64_t& out_base, std::vector<uint64_t>& out_init_funcs) {
+    if (!loader_->parse(data)) {
+        EMU_LOG << "[EMU][dlopen] parse failed: " << name << std::endl;
+        return false;
+    }
+
+    // Bound the arena BEFORE mapping. loader_->load() maps segments with MAP_FIXED, which
+    // would overlay (clobber) the live guest heap if the module crossed HEAP_BASE. Reject
+    // first, using the parsed virtual span, instead of detecting it after the damage.
+    uint64_t span = loader_->get_memory_size();
+    if (span == 0 ||
+        next_load_addr_ + span < next_load_addr_ ||        // address overflow
+        next_load_addr_ + span >= HEAP_BASE) {
+        EMU_LOG << "[EMU][dlopen] module arena exhausted/oversized loading " << name
+                << " (next=0x" << std::hex << next_load_addr_ << " span=0x" << span
+                << " HEAP_BASE=0x" << HEAP_BASE << ")" << std::dec << std::endl;
+        return false;
+    }
+
+    // Hard cap so modules_.push_back() never reallocates the vector. reserve(256) backs
+    // this; a stable backing buffer keeps element addresses valid for concurrent readers.
+    if (modules_.size() >= modules_.capacity()) {
+        EMU_LOG << "[EMU][dlopen] module limit reached (" << modules_.capacity()
+                << "); refusing to load " << name << std::endl;
+        return false;
+    }
+
+    LoadedModule module;
+    module.name = name;
+    module.path = host_path;
+    // module.data is intentionally NOT retained: the ELF is already parsed and the raw
+    // bytes are never read after load; keeping a per-module copy wastes host RAM.
+
+    if (!loader_->load(*memory_, next_load_addr_, module)) {
+        EMU_LOG << "[EMU][dlopen] map/load failed: " << name << std::endl;
+        return false;
+    }
+    next_load_addr_ = (module.base_address + module.size + 0xFFFFF) & ~0xFFFFFULL;
+
+    auto resolver = [this](const std::string& sym) -> uint64_t { return resolve_import(sym); };
+    if (!relocator_->process_relocations(*loader_, module.base_address, resolver)) {
+        EMU_LOG << "[EMU][dlopen] relocation failed (unresolved symbol) in " << name << std::endl;
+        return false;
+    }
+
+    // Collect this module's init_array (run by the caller, after the lock is released).
+    auto [init_array_addr, init_array_size] = loader_->get_init_array_info();
+    if (init_array_addr != 0 && init_array_size > 0) {
+        uint64_t min_vaddr = loader_->get_min_vaddr();
+        uint64_t runtime_init_addr = init_array_addr - min_vaddr + module.base_address;
+        for (size_t i = 0; i < init_array_size / 8; i++) {
+            uint64_t fp = 0;
+            if (memory_->read(runtime_init_addr + i * 8, &fp, 8) &&
+                fp != 0 && fp != static_cast<uint64_t>(-1)) {
+                out_init_funcs.push_back(fp);
+            }
+        }
+    }
+
+    // Guest-resident copy of the path so dladdr() can return a valid dli_fname.
+    module.guest_name_str = intern_guest_string(host_path);
+
+    out_base = module.base_address;
+    modules_.push_back(std::move(module));  // publish: exports now visible to dlsym + later loads
+    return true;
+}
+
+uint64_t Emulator::dl_open(const std::string& guest_path, int flags) {
+    constexpr int kRtldNoload = 0x00004;  // bionic RTLD_NOLOAD
+
+    tl_dl_error.clear();  // a successful dlopen must not leave a stale error for dlerror()
+
+    std::string host_path = resolve_library_path(guest_path);
+    if (host_path.empty()) {
+        tl_dl_error = "dlopen failed: cannot locate \"" + guest_path + "\"";
+        return 0;
+    }
+    size_t slash = host_path.find_last_of("/\\");
+    std::string base_name = (slash == std::string::npos) ? host_path : host_path.substr(slash + 1);
+
+    uint64_t handle = 0;
+    std::vector<uint64_t> init_funcs;
+    {
+        std::unique_lock<std::shared_mutex> lk(modules_mutex_);
+
+        // Already loaded? Return the SAME handle and bump the refcount. Dedup on the
+        // resolved host path; fall back to basename ONLY for modules with no recorded
+        // path (startup-loaded libs), so two different files sharing a basename in
+        // different directories are not wrongly aliased.
+        for (const auto& mod : modules_) {
+            if ((!mod.path.empty() && mod.path == host_path) ||
+                (mod.path.empty() && mod.name == base_name)) {
+                dl_refcounts_[mod.base_address]++;
+                return mod.base_address;
+            }
+        }
+        if (flags & kRtldNoload) {
+            return 0;  // RTLD_NOLOAD: probe only, not present
+        }
+
+        std::ifstream f(host_path, std::ios::binary);
+        if (!f) {
+            tl_dl_error = "dlopen failed: cannot open \"" + host_path + "\"";
+            return 0;
+        }
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
+                                  std::istreambuf_iterator<char>());
+
+        if (!load_module_locked(base_name, host_path, data, handle, init_funcs)) {
+            tl_dl_error = "dlopen failed: could not load/relocate \"" + host_path + "\"";
+            return 0;
+        }
+        dl_refcounts_[handle] = 1;
+
+        // Queue a deferred (async) JIT flush. The freshly bump-allocated range has never
+        // been executed, so there are no stale translation blocks to drop and correctness
+        // does NOT depend on this draining before the constructors run. Kept defensive in
+        // case the module arena is ever made to reuse a previously-executed range. Must
+        // stay the async variant: a synchronous tb_flush under the unique lock could
+        // rendezvous-deadlock against a vCPU parked in an HLE handler awaiting the lock.
+        libafl_flush_jit();
+    }
+
+    // Run constructors AFTER releasing the lock: init_array re-enters guest code (which
+    // takes the shared lock for symbol lookups) and may itself dlopen. call_function_safe
+    // runs them in-place on the current worker vCPU's safe-call stack.
+    for (uint64_t init_addr : init_funcs) {
+        call_function_safe(init_addr, {});
+    }
+    return handle;
+}
+
+uint64_t Emulator::dl_sym(uint64_t handle, const std::string& name) {
+    std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+
+    // RTLD_DEFAULT (0) / RTLD_NEXT (-1): global search (approximated as all modules).
+    if (handle == 0 || handle == static_cast<uint64_t>(-1)) {
+        uint64_t addr = get_symbol_nolock(name);
+        if (addr != 0) return addr;
+        // libc-style symbols live as HLE stubs, not in any module's exports.
+        addr = hle_->get_stub_address(name);
+        if (addr == 0) tl_dl_error = "dlsym: undefined symbol \"" + name + "\"";
+        return addr;
+    }
+
+    const LoadedModule* mod = find_module_by_base(handle);
+    if (!mod) {
+        tl_dl_error = "dlsym: invalid handle";
+        return 0;
+    }
+    // Only exported (default-visibility global/weak) symbols, per the dlsym contract.
+    auto e = mod->exports.find(name);
+    if (e != mod->exports.end()) return e->second;
+    tl_dl_error = "dlsym: undefined symbol \"" + name + "\"";
+    return 0;
+}
+
+int Emulator::dl_close(uint64_t handle) {
+    std::unique_lock<std::shared_mutex> lk(modules_mutex_);
+    auto it = dl_refcounts_.find(handle);
+    if (it != dl_refcounts_.end() && it->second > 0) {
+        it->second--;
+    }
+    // No real unload: the module stays mapped and its exports remain resolvable
+    // (next_load_addr_ is a non-reclaiming bump pointer). Always report success.
+    return 0;
+}
+
+std::string Emulator::dl_take_error() {
+    std::string e = tl_dl_error;
+    tl_dl_error.clear();
+    return e;
+}
+
+int Emulator::dl_addr(uint64_t guest_addr, uint64_t info_ptr) {
+    if (info_ptr == 0) return 0;
+    std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+    for (const auto& mod : modules_) {
+        if (guest_addr >= mod.base_address && guest_addr < mod.base_address + mod.size) {
+            // The contract requires a valid dli_fname on success. If we have no
+            // guest-resident path string for this module, report "not found" (return 0)
+            // rather than success-with-NULL — a guest using info.dli_fname would otherwise
+            // dereference NULL.
+            if (mod.guest_name_str == 0) return 0;
+            // Nearest preceding exported symbol address for dli_saddr (best effort).
+            uint64_t best_addr = 0;
+            for (const auto& kv : mod.exports) {
+                if (kv.second <= guest_addr && kv.second >= best_addr) best_addr = kv.second;
+            }
+            // bionic Dl_info (LP64): { const char* dli_fname; void* dli_fbase;
+            //                          const char* dli_sname; void* dli_saddr; }
+            uint64_t dli_fname = mod.guest_name_str;
+            uint64_t dli_fbase = mod.base_address;
+            uint64_t dli_sname = 0;  // symbol-name string not interned into guest memory
+            uint64_t dli_saddr = best_addr;
+            bool ok = mem_write(info_ptr + 0,  &dli_fname, 8) &&
+                      mem_write(info_ptr + 8,  &dli_fbase, 8) &&
+                      mem_write(info_ptr + 16, &dli_sname, 8) &&
+                      mem_write(info_ptr + 24, &dli_saddr, 8);
+            return ok ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
+// Allocate a NUL-terminated guest-resident copy of a host string (for dladdr dli_fname).
+uint64_t Emulator::intern_guest_string(const std::string& s) {
+    uint64_t addr = memory_->allocate_guest_memory(s.size() + 1, 1);
+    if (addr != 0) {
+        memory_->write(addr, s.c_str(), s.size() + 1);
+    }
+    return addr;
+}
+
+// Locked accessors so callers outside the Emulator can read modules_ without racing a
+// concurrent dlopen push_back (the raw modules() accessor is startup-only).
+std::string Emulator::module_name_containing(uint64_t addr) const {
+    std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+    for (const auto& mod : modules_) {
+        if (addr >= mod.base_address && addr < mod.base_address + mod.size) {
+            return mod.name;
+        }
+    }
+    return "";
+}
+
+uint64_t Emulator::main_module_base() const {
+    std::shared_lock<std::shared_mutex> lk(modules_mutex_);
+    return modules_.empty() ? 0 : modules_.front().base_address;
 }
 
 void Emulator::hook_hle_functions_at_addresses() {

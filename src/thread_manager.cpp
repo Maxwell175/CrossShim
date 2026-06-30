@@ -1153,14 +1153,12 @@ int ThreadManager::pthread_create(uint64_t thread_ptr, uint64_t attr,
               << " tpidr_el0=0x" << ctx->registers.tpidr_el0
               << std::dec << std::endl;
 
-    // Find which module the routine belongs to
-    for (const auto& mod : emu_.modules()) {
-        if (start_routine >= mod.base_address && start_routine < mod.base_address + mod.size) {
-            uint64_t offset = start_routine - mod.base_address;
-            EMU_LOG << "[THREAD] pthread_create: routine is in module '" << mod.name
-                      << "' at offset 0x" << std::hex << offset << std::dec << std::endl;
-            break;
-        }
+    // Find which module the routine belongs to (locked accessor: safe against a
+    // concurrent runtime dlopen mutating modules_ on another vCPU).
+    std::string routine_module = emu_.module_name_containing(start_routine);
+    if (!routine_module.empty()) {
+        EMU_LOG << "[THREAD] pthread_create: routine is in module '" << routine_module
+                  << "'" << std::endl;
     }
 
     // Add to threads and runnable queue

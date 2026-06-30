@@ -29,6 +29,7 @@
 #include <functional>
 #include <unordered_map>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <condition_variable>
 #include <queue>
@@ -80,6 +81,7 @@ struct LoadedModule {
     uint64_t size;
     std::unordered_map<std::string, uint64_t> exports;
     std::unordered_map<std::string, uint64_t> local_symbols;  // .symtab fallback (e.g. local `main`)
+    uint64_t guest_name_str = 0;  // guest-resident copy of path/name (for dladdr dli_fname)
     std::vector<uint8_t> data;
 };
 
@@ -121,7 +123,20 @@ public:
     // Symbol resolution
     uint64_t get_symbol(const std::string& name) const;
     uint64_t get_symbol(const std::string& module, const std::string& name) const;
-    
+
+    // Dynamic loading backends (implement the guest dlopen/dlsym/dlclose/dlerror/dladdr).
+    // Generic: works for any ARM64 .so (CPython extension modules, ordinary libs).
+    uint64_t dl_open(const std::string& path, int flags);
+    uint64_t dl_sym(uint64_t handle, const std::string& name);
+    int dl_close(uint64_t handle);
+    std::string dl_take_error();   // returns + clears the calling thread's last dl error
+    int dl_addr(uint64_t guest_addr, uint64_t info_ptr);
+
+    // Thread-safe module queries for callers outside the Emulator (take a shared lock so
+    // they don't race a concurrent runtime dlopen). Prefer these over modules() iteration.
+    std::string module_name_containing(uint64_t addr) const;  // "" if none
+    uint64_t main_module_base() const;                        // 0 if no modules loaded
+
 
     // Function invocation
     uint64_t call_function(uint64_t address, const std::vector<uint64_t>& args = {});
@@ -170,6 +185,7 @@ public:
 
     // Get the base address of a loaded library by name
     uint64_t get_library_base(const std::string& name) const {
+        std::shared_lock<std::shared_mutex> lk(modules_mutex_);
         for (const auto& mod : modules_) {
             if (mod.name == name) {
                 return mod.base_address;
@@ -198,6 +214,25 @@ public:
 private:
     uint64_t allocate_hle_stub(const std::string& name);
 
+    // --- Dynamic loading internals --------------------------------------------
+    // Lock-free import resolver (HLE stub -> global_symbols_ -> module exports),
+    // used during relocation. Callers are serialized by modules_mutex_.
+    uint64_t resolve_import(const std::string& sym_name) const;
+    // Lock-free symbol lookups (callers hold modules_mutex_ shared/unique).
+    uint64_t get_symbol_nolock(const std::string& name) const;
+    uint64_t get_symbol_nolock(const std::string& module, const std::string& name) const;
+    const LoadedModule* find_module_by_base(uint64_t base) const;
+    // Allocate a NUL-terminated guest-resident copy of a host string.
+    uint64_t intern_guest_string(const std::string& s);
+    // Find a .so on the host filesystem from a guest path or bare soname.
+    std::string resolve_library_path(const std::string& guest_path) const;
+    // Parse/map/relocate/publish a module at next_load_addr_; collects its init_array
+    // into out_init_funcs (run by the caller AFTER releasing the lock). Caller MUST
+    // hold modules_mutex_ unique lock.
+    bool load_module_locked(const std::string& name, const std::string& host_path,
+                            const std::vector<uint8_t>& data,
+                            uint64_t& out_base, std::vector<uint64_t>& out_init_funcs);
+
     CPUState* cpu_;  // QEMU CPU state
     EmulatorConfig config_;
     bool qemu_initialized_ = false;
@@ -219,6 +254,10 @@ private:
 
     std::vector<LoadedModule> modules_;
     std::unordered_map<std::string, uint64_t> global_symbols_;
+    // Guards modules_, global_symbols_, next_load_addr_ and dl_refcounts_ so a runtime
+    // dlopen on one worker vCPU can publish a module while other vCPUs read symbols.
+    mutable std::shared_mutex modules_mutex_;
+    std::unordered_map<uint64_t, int> dl_refcounts_;  // dlopen handle (module base) -> refcount
     std::unordered_map<uint64_t, HleCallback> hle_callbacks_;
     std::unordered_map<std::string, uint64_t> hle_stubs_;
 
