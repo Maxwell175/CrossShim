@@ -1167,6 +1167,13 @@ uint64_t hle_get_current_pthread_id(Emulator& emu) {
     return get_current_guest_pthread_id(emu);
 }
 
+// Maps a sync-thread-id (the per-host-thread mutex-ownership key) to that thread's host
+// TID. setpriority/getpriority and the synthesized /proc/<tid>/stat are keyed by the host
+// TID (hle_get_current_visible_tid), so PI-mutex priority boosting must translate the
+// mutex owner's sync-id to its host TID to land the boost on the right entry.
+static std::mutex g_sync_to_host_tid_lock;
+static std::unordered_map<uint64_t, pid_t> g_sync_to_host_tid;
+
 static uint64_t get_current_sync_thread_id(Emulator& emu) {
     (void)emu;
     // Mutex/cond/rwlock ownership MUST track the HOST thread that actually owns the
@@ -1180,8 +1187,22 @@ static uint64_t get_current_sync_thread_id(Emulator& emu) {
     if (host_sync_id == 0) {
         static std::atomic<uint64_t> next_host_sync_id{0x80000000ULL};
         host_sync_id = next_host_sync_id.fetch_add(1, std::memory_order_relaxed);
+#ifdef SYS_gettid
+        pid_t host_tid = static_cast<pid_t>(::syscall(SYS_gettid));
+#else
+        pid_t host_tid = static_cast<pid_t>(::getpid());
+#endif
+        std::lock_guard<std::mutex> lk(g_sync_to_host_tid_lock);
+        g_sync_to_host_tid[host_sync_id] = host_tid;
     }
     return host_sync_id;
+}
+
+// Translate a mutex owner's sync-id back to its host TID (0 if unknown).
+static pid_t sync_id_to_host_tid(uint64_t sync_id) {
+    std::lock_guard<std::mutex> lk(g_sync_to_host_tid_lock);
+    auto it = g_sync_to_host_tid.find(sync_id);
+    return (it != g_sync_to_host_tid.end()) ? it->second : 0;
 }
 
 pid_t hle_get_current_visible_tid(Emulator& emu) {
@@ -2092,8 +2113,10 @@ void register_hle_pthread(HleManager& hle) {
         pid_t pi_owner_tid = 0;
         if (mtx->protocol == PTHREAD_PRIO_INHERIT && mtx->lock_count.load() > 0 &&
             mtx->owner_thread.load() != visible_tid) {
-            pi_owner_tid = static_cast<pid_t>(mtx->owner_thread.load());
-            hle_sched_pi_boost_begin(pi_owner_tid);
+            pi_owner_tid = sync_id_to_host_tid(mtx->owner_thread.load());
+            if (pi_owner_tid > 0) {
+                hle_sched_pi_boost_begin(pi_owner_tid);
+            }
         }
         if (g_lock_trace && mtx->lock_count.load() > 0 && mtx->owner_thread.load() != visible_tid) {
             EMU_ALWAYS_LOG << "[LOCKTRACE] T0x" << std::hex << visible_tid << " WAIT mutex 0x"
@@ -3759,8 +3782,10 @@ void register_hle_pthread(HleManager& hle) {
         pid_t pi_owner_tid = 0;
         if (m->protocol == PTHREAD_PRIO_INHERIT && m->lock_count.load() > 0 &&
             m->owner_thread.load() != visible_tid) {
-            pi_owner_tid = static_cast<pid_t>(m->owner_thread.load());
-            hle_sched_pi_boost_begin(pi_owner_tid);
+            pi_owner_tid = sync_id_to_host_tid(m->owner_thread.load());
+            if (pi_owner_tid > 0) {
+                hle_sched_pi_boost_begin(pi_owner_tid);
+            }
         }
         int result = lock_mutex_with_timeout(*m, visible_tid, CLOCK_REALTIME, ts_ptr);
         if (pi_owner_tid > 0) {
@@ -3786,8 +3811,10 @@ void register_hle_pthread(HleManager& hle) {
         pid_t pi_owner_tid = 0;
         if (m->protocol == PTHREAD_PRIO_INHERIT && m->lock_count.load() > 0 &&
             m->owner_thread.load() != visible_tid) {
-            pi_owner_tid = static_cast<pid_t>(m->owner_thread.load());
-            hle_sched_pi_boost_begin(pi_owner_tid);
+            pi_owner_tid = sync_id_to_host_tid(m->owner_thread.load());
+            if (pi_owner_tid > 0) {
+                hle_sched_pi_boost_begin(pi_owner_tid);
+            }
         }
         int result = lock_mutex_with_timeout(*m, visible_tid, CLOCK_MONOTONIC, ts_ptr);
         if (pi_owner_tid > 0) {
@@ -3813,8 +3840,10 @@ void register_hle_pthread(HleManager& hle) {
         pid_t pi_owner_tid = 0;
         if (m->protocol == PTHREAD_PRIO_INHERIT && m->lock_count.load() > 0 &&
             m->owner_thread.load() != visible_tid) {
-            pi_owner_tid = static_cast<pid_t>(m->owner_thread.load());
-            hle_sched_pi_boost_begin(pi_owner_tid);
+            pi_owner_tid = sync_id_to_host_tid(m->owner_thread.load());
+            if (pi_owner_tid > 0) {
+                hle_sched_pi_boost_begin(pi_owner_tid);
+            }
         }
         int result = lock_mutex_with_timeout(*m, visible_tid, clockid, ts_ptr);
         if (pi_owner_tid > 0) {
