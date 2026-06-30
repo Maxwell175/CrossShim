@@ -122,6 +122,24 @@ void register_hle_mem_ops(HleManager& hle) {
         set_reg(emu, UC_ARM64_REG_X0, result);
     });
 
+    // memccpy - copy bytes from src to dst, stopping after the first occurrence of c.
+    // Returns a pointer to the byte in dst just past c, or NULL if c not found in n bytes.
+    hle.register_function("memccpy", [](Emulator& emu) {
+        uint64_t dst = get_reg(emu, UC_ARM64_REG_X0);
+        uint64_t src = get_reg(emu, UC_ARM64_REG_X1);
+        uint8_t c = static_cast<uint8_t>(get_reg(emu, UC_ARM64_REG_X2) & 0xFF);
+        size_t n = get_reg(emu, UC_ARM64_REG_X3);
+        std::vector<uint8_t> buf(n);
+        if (n) emu.mem_read(src, buf.data(), n);
+        uint64_t ret = 0;
+        size_t copy_len = n;
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] == c) { copy_len = i + 1; ret = dst + copy_len; break; }
+        }
+        if (copy_len) emu.mem_write(dst, buf.data(), copy_len);
+        set_reg(emu, UC_ARM64_REG_X0, ret);
+    });
+
     // memchr - uses direct host memory when possible, falls back to batched reads
     hle.register_function("memchr", [](Emulator& emu) {
         uint64_t s = get_reg(emu, UC_ARM64_REG_X0);

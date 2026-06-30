@@ -443,6 +443,46 @@ void register_hle_stdlib(HleManager& hle) {
         ::srandom(seed);
     });
 
+    hle.register_function("nrand48", [](Emulator& emu) {
+        uint64_t xsubi_addr = get_reg(emu, UC_ARM64_REG_X0);
+        unsigned short xsubi[3] = {};
+        emu.mem_read(xsubi_addr, xsubi, sizeof(xsubi));
+        long result = ::nrand48(xsubi);
+        emu.mem_write(xsubi_addr, xsubi, sizeof(xsubi));
+        set_reg(emu, UC_ARM64_REG_X0, static_cast<uint64_t>(static_cast<int64_t>(result)));
+    });
+
+    hle.register_function("lrand48", [](Emulator& emu) {
+        set_reg(emu, UC_ARM64_REG_X0, static_cast<uint64_t>(static_cast<int64_t>(::lrand48())));
+    });
+
+    hle.register_function("srand48", [](Emulator& emu) {
+        ::srand48(static_cast<long>(get_reg(emu, UC_ARM64_REG_X0)));
+    });
+
+    // rand_r: reentrant rand() using a caller-provided seed.
+    hle.register_function("rand_r", [](Emulator& emu) {
+        uint64_t seed_addr = get_reg(emu, UC_ARM64_REG_X0);
+        unsigned int seed = 0;
+        emu.mem_read(seed_addr, &seed, sizeof(seed));
+        int result = ::rand_r(&seed);
+        emu.mem_write(seed_addr, &seed, sizeof(seed));
+        set_reg(emu, UC_ARM64_REG_X0, static_cast<uint64_t>(static_cast<uint32_t>(result)));
+    });
+
+    // arc4random_uniform: unbiased uniform in [0, upper_bound) via rejection sampling.
+    hle.register_function("arc4random_uniform", [](Emulator& emu) {
+        uint32_t upper = static_cast<uint32_t>(get_reg(emu, UC_ARM64_REG_X0));
+        uint32_t result = 0;
+        if (upper >= 2) {
+            uint32_t min = (0u - upper) % upper;  // 2^32 mod upper_bound
+            uint32_t r;
+            do { r = static_cast<uint32_t>(g_rng()); } while (r < min);
+            result = r % upper;
+        }
+        set_reg(emu, UC_ARM64_REG_X0, result);
+    });
+
     // ========================================================================
     // Sorting and searching
     // ========================================================================
