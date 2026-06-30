@@ -259,38 +259,6 @@ void ThreadManager::restore_thread_state(ThreadContext* ctx) {
 
     // IMMEDIATE PREEMPTION FIX: Block the next context_switch() call
     ctx->block_next_switch = true;
-
-    if (emu_.is_debug() && ctx->registers.pc >= 0x40002f24 && ctx->registers.pc <= 0x40002fc0) {
-        // Check key PCs in the thread function
-        if (ctx->registers.pc == 0x40002f24) {
-            // Function entry - read the value at X0 address
-            uint64_t x0 = ctx->registers.x[0];
-            int32_t value_at_x0 = 0;
-            if (emu_.mem_read(x0, &value_at_x0, sizeof(value_at_x0))) {
-                EMU_LOG << "[SCHED] Thread " << ctx->thread_id
-                          << " at function entry, X0=0x" << std::hex << x0
-                          << " value=" << std::dec << value_at_x0
-                          << " X19(ctx)=" << ctx->registers.x[19]
-                          << " SP=0x" << std::hex << ctx->registers.sp << std::dec
-                          << std::endl;
-            } else {
-                EMU_LOG << "[SCHED] Thread " << ctx->thread_id
-                          << " at function entry, X0=0x" << std::hex << x0
-                          << " (failed to read)" << std::dec << std::endl;
-            }
-        }
-        // Check at the ldr w19, [x0] instruction (0x40002f30)
-        if (ctx->registers.pc == 0x40002f30) {
-            uint64_t x0 = ctx->registers.x[0];
-            int32_t value_at_x0 = 0;
-            if (emu_.mem_read(x0, &value_at_x0, sizeof(value_at_x0))) {
-                EMU_LOG << "[SCHED] Thread " << ctx->thread_id
-                          << " at ldr w19,[x0], X0=0x" << std::hex << x0
-                          << " value=" << std::dec << value_at_x0
-                          << std::endl;
-            }
-        }
-    }
 }
 
 // Select next thread to run (round-robin from runnable queue)

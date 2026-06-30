@@ -112,52 +112,19 @@ bool RelocationHandler::process_relocation(
 
         case R_AARCH64_JUMP_SLOT: {
             uint64_t value = symbol_value;
-            bool is_target_symbol = (symbol_name == "avClientStart_inner" ||
-                                    symbol_name == "avServStart2_inner" ||
-                                    symbol_name == "avClientStartEx");
-
-            // Also track calloc/epoll_create/pthread_create for PLT debugging
-            bool is_plt_debug = (symbol_name.find("calloc") != std::string::npos ||
-                                symbol_name.find("epoll_create") != std::string::npos ||
-                                symbol_name.find("pthread_create") != std::string::npos ||
-                                symbol_name.find("CreateTask") != std::string::npos ||
-                                symbol_name.find("TUTK3rdECDH") != std::string::npos ||
-                                symbol_name.find("TUTKSSL") != std::string::npos ||
-                                symbol_name.find("Resolve") != std::string::npos);
-
-            if (is_target_symbol) {
-                EMU_LOG << "[RELOC JUMP_SLOT] symbol=" << symbol_name
-                         << " symbol_value=0x" << std::hex << symbol_value
-                         << " base=0x" << base_address
-                         << " offset=0x" << offset << std::dec << std::endl;
-            }
-
             if (value == 0 && !symbol_name.empty() && resolver) {
                 // Try with original name first, then without version suffix
                 value = resolver(symbol_name);
                 if (value == 0) {
                     value = resolver(strip_version_suffix(symbol_name));
                 }
-                if (is_target_symbol) {
-                    EMU_LOG << "[RELOC JUMP_SLOT] Resolved " << symbol_name
-                             << " to 0x" << std::hex << value << std::dec << std::endl;
-                }
             } else if (value != 0) {
                 value += base_address;
-                if (is_target_symbol) {
-                    EMU_LOG << "[RELOC JUMP_SLOT] Added base to " << symbol_name
-                             << " = 0x" << std::hex << value << std::dec << std::endl;
-                }
             }
             if (value == 0 && !symbol_name.empty()) {
                 EMU_LOG << "[RELOC] WARNING: Unresolved JUMP_SLOT symbol: " << symbol_name
                           << " at 0x" << std::hex << address << std::dec << std::endl;
                 unresolved_.push_back(symbol_name);
-            }
-            // Debug: log critical PLT GOT writes
-            if (is_plt_debug) {
-                EMU_LOG << "[RELOC JUMP_SLOT] Writing GOT[0x" << std::hex << address
-                         << "] = 0x" << value << " for " << symbol_name << std::dec << std::endl;
             }
             return apply_jump_slot(address, value, signed_addend);
         }

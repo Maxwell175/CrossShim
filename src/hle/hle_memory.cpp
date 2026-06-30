@@ -35,8 +35,7 @@ void register_hle_memory(HleManager& hle) {
     hle.register_function("malloc", [](Emulator& emu) {
         uint64_t size = get_reg(emu, UC_ARM64_REG_X0);
         uint64_t ptr = emu.memory().allocate_guest_memory(size, 16);
-        // Log allocations for debugging - especially 0x2350 which is IKalayAVNew
-        if (size == 0x2350 || ptr == 0) {
+        if (ptr == 0) {
             EMU_LOG << "[HLE] malloc: size=0x" << std::hex << size << " ptr=0x" << ptr << std::dec << std::endl;
         }
         set_reg(emu, UC_ARM64_REG_X0, ptr);

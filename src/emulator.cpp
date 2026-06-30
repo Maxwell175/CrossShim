@@ -3186,16 +3186,6 @@ bool Emulator::load_library(const std::string& name, const std::vector<uint8_t>&
             }
         }
 
-        // Debug: log unresolved symbols that look like tutk_platform functions
-        if (sym_name.find("tutk_platform") != std::string::npos) {
-            EMU_LOG << "[RELOC] WARNING: Could not resolve " << sym_name
-                      << " - checking " << modules_.size() << " modules" << std::endl;
-            for (const auto& mod : modules_) {
-                EMU_LOG << "[RELOC]   Module " << mod.name << " has "
-                          << mod.exports.size() << " exports" << std::endl;
-            }
-        }
-
         return 0;
     };
     if (!relocator_->process_relocations(*loader_, module.base_address, resolver)) {
